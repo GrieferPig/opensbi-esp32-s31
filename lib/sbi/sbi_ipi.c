@@ -200,6 +200,7 @@ void sbi_ipi_event_destroy(u32 event)
 static void sbi_ipi_process_smode(struct sbi_scratch *scratch)
 {
 	csr_set(CSR_MIP, MIP_SSIP);
+	*(volatile uint8_t *)0x10801004 = 1; // ESP32-S31 Hack: CLIC ID 1 (IPI) IP = 1
 }
 
 static struct sbi_ipi_event_ops ipi_smode_ops = {
@@ -217,6 +218,7 @@ int sbi_ipi_send_smode(ulong hmask, ulong hbase)
 void sbi_ipi_clear_smode(void)
 {
 	csr_clear(CSR_MIP, MIP_SSIP);
+	*(volatile uint8_t *)0x10801004 = 0; // ESP32-S31 Hack: CLIC ID 1 (IPI) IP = 0
 }
 
 static int sbi_ipi_update_halt(struct sbi_scratch *scratch,
@@ -248,6 +250,7 @@ int sbi_ipi_send_halt(ulong hmask, ulong hbase)
 
 void sbi_ipi_process(void)
 {
+	*(volatile uint8_t *)0x1080100c = 0; // ESP32-S31 Hack: Clear CLIC ID 3 (M-mode IPI) IP
 	unsigned long ipi_type;
 	unsigned int ipi_event;
 	const struct sbi_ipi_event_ops *ipi_ops;

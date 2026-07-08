@@ -31,6 +31,35 @@ static unsigned long timer_state_off;
 static u64 (*get_time_val)(void);
 static const struct sbi_timer_device *timer_dev = NULL;
 
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+#define S31_CLIC_S_TIMER_ID		5
+#define S31_CLIC_CTRL_BASE		0x10801000UL
+#define S31_CLIC_WORD(id)		(S31_CLIC_CTRL_BASE + (4UL * (id)))
+#define S31_CLIC_INT_IP		0
+#define S31_CLIC_INT_IE		1
+#define S31_CLIC_INT_ATTR		2
+#define S31_CLIC_INT_CTL		3
+#define S31_CLIC_ATTR_S_EDGE		0x42
+#define S31_CLIC_CTL_MAX		0xff
+
+static void s31_trigger_smode_timer_irq(void)
+{
+	volatile uint8_t *clic_stmr = (uint8_t *)S31_CLIC_WORD(S31_CLIC_S_TIMER_ID);
+
+	clic_stmr[S31_CLIC_INT_ATTR] = S31_CLIC_ATTR_S_EDGE;
+	clic_stmr[S31_CLIC_INT_CTL] = S31_CLIC_CTL_MAX;
+	clic_stmr[S31_CLIC_INT_IP] = 0;
+	clic_stmr[S31_CLIC_INT_IP] = 1;
+}
+
+static void s31_clear_smode_timer_irq(void)
+{
+	volatile uint8_t *clic_stmr = (uint8_t *)S31_CLIC_WORD(S31_CLIC_S_TIMER_ID);
+
+	clic_stmr[S31_CLIC_INT_IP] = 0;
+}
+#endif
+
 #if __riscv_xlen == 32
 static u64 get_ticks(void)
 {
@@ -158,11 +187,13 @@ static void __sbi_timer_update_device(struct timer_state *tstate)
 		if (timer_dev->timer_event_stop)
 			timer_dev->timer_event_stop();
 		csr_clear(CSR_MIE, MIP_MTIP);
+		*(volatile uint8_t *)0x1080101d = 0; // ESP32-S31 Hack: Disable CLIC ID 7
 	} else {
 		ev = sbi_list_first_entry(&tstate->event_list, struct sbi_timer_event, head);
 		if (timer_dev->timer_event_start)
 			timer_dev->timer_event_start(ev->time_stamp);
-		csr_set(CSR_MIE, MIP_MTIP);
+		*(volatile uint8_t *)0x1080101c = 0; // ESP32-S31 Hack: Clear CLIC ID 7 IP
+		*(volatile uint8_t *)0x1080101d = 1; // ESP32-S31 Hack: Enable CLIC ID 7
 	}
 }
 
@@ -256,14 +287,24 @@ static void sbi_timer_smode_event_callback(struct sbi_timer_event *ev,
 	 * directly without M-mode come in between. This function should
 	 * only invoked if M-mode programs the timer for its own purpose.
 	 */
-	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC))
+	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		s31_trigger_smode_timer_irq();
+#else
 		csr_set(CSR_MIP, MIP_STIP);
+#endif
+	}
 }
 
 static void sbi_timer_smode_event_cleanup(struct sbi_timer_event *ev)
 {
-	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC))
+	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		s31_clear_smode_timer_irq();
+#else
 		csr_clear(CSR_MIP, MIP_STIP);
+#endif
+	}
 }
 
 void sbi_timer_smode_event_start(u64 next_event)
@@ -280,10 +321,26 @@ void sbi_timer_smode_event_start(u64 next_event)
 	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
 		csr_write64(CSR_STIMECMP, next_event);
 	} else {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		s31_clear_smode_timer_irq();
+#else
 		csr_clear(CSR_MIP, MIP_STIP);
+#endif
 		sbi_timer_event_start(&tstate->smode_ev, next_event);
 	}
 }
+
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+bool sbi_timer_smode_event_pending(void)
+{
+	return false;
+}
+
+void sbi_timer_smode_event_clear_pending(void)
+{
+	s31_clear_smode_timer_irq();
+}
+#endif
 
 void sbi_timer_process(void)
 {
@@ -333,8 +390,19 @@ void sbi_timer_set_device(const struct sbi_timer_device *dev)
 		return;
 
 	timer_dev = dev;
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/*
+	 * ESP32-S31 Linux and OpenSBI timer delivery both ultimately use the
+	 * platform MTIME/MTIMECMP block.  Force the software timebase to that
+	 * device as well so TIME CSR emulation and event comparisons stay in
+	 * the same clock domain.
+	 */
+	if (timer_dev->timer_value)
+		get_time_val = timer_dev->timer_value;
+#else
 	if (!get_time_val && timer_dev->timer_value)
 		get_time_val = timer_dev->timer_value;
+#endif
 }
 
 int sbi_timer_init(struct sbi_scratch *scratch, bool cold_boot)

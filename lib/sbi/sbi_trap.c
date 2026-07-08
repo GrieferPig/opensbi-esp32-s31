@@ -13,6 +13,7 @@
 #include <sbi/sbi_console.h>
 #include <sbi/sbi_double_trap.h>
 #include <sbi/sbi_ecall.h>
+#include <sbi/sbi_emulate_csr.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_illegal_insn.h>
@@ -200,12 +201,21 @@ int sbi_trap_redirect(struct sbi_trap_regs *regs,
 		csr_write(CSR_VSSTATUS, vsstatus);
 	} else {
 		/* Update S-mode exception info */
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		sbi_scsr_write(CSR_STVAL, trap->tval);
+		sbi_scsr_write(CSR_SEPC, regs->mepc);
+		sbi_scsr_write(CSR_SCAUSE, trap->cause);
+
+		/* On S31 only the interrupt CSRs still need shadow emulation. */
+		regs->mepc = sbi_scsr_read(CSR_STVEC) & ~MTVEC_MODE;
+#else
 		csr_write(CSR_STVAL, trap->tval);
 		csr_write(CSR_SEPC, regs->mepc);
 		csr_write(CSR_SCAUSE, trap->cause);
 
 		/* Set MEPC to S-mode exception vector base */
 		regs->mepc = csr_read(CSR_STVEC) & ~MTVEC_MODE;
+#endif
 
 		/* Set MPP to S-mode */
 		regs->mstatus &= ~MSTATUS_MPP;
@@ -320,10 +330,27 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 					   SBI_HART_EXT_SMAIA))
 			rc = sbi_trap_aia_irq();
 		else
-			rc = sbi_trap_nonaia_irq(mcause & ~MCAUSE_IRQ_MASK);
+			rc = sbi_trap_nonaia_irq(mcause & 0xfff);
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		/*
+		 * On S31 the M-mode hardware timer is CLIC ID7, while Linux
+		 * consumes the event as S-mode CLIC ID5.  The timer callback
+		 * asserts ID5 directly; never redirect through stvec from here
+		 * because ID7 can preempt S-mode while Linux is saving/restoring
+		 * the interrupted U/S context.
+		 */
+#endif
 		msg = "unhandled local interrupt";
 		goto trap_done;
 	}
+
+	/* S31 CLIC: mcause exceptions carry implementation-specific bits in
+	 * the upper region above the standard 4-bit exception code (e.g.
+	 * illegal instruction appears as 0x30000002 instead of 2).  Mask to
+	 * the standard code range so that the switch cases still match.
+	 * Use 0xfff to preserve CLIC interrupt IDs up to 47 (external IRQs
+	 * are IDs 16-47).  Do NOT use & 0xF which truncates IDs >= 16. */
+	mcause &= 0xfff;
 
 	switch (mcause) {
 	case CAUSE_ILLEGAL_INSTRUCTION:
@@ -347,7 +374,13 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 		break;
 	case CAUSE_LOAD_ACCESS:
 		sbi_pmu_ctr_incr_fw(SBI_PMU_FW_ACCESS_LOAD);
-		rc  = sbi_load_access_handler(tcntx);
+		sbi_printf("S31: Load Access Fault at mepc=0x%lx, mtval=0x%lx\n", regs->mepc, tcntx->trap.tval);
+		rc = sbi_trap_redirect(regs, trap);
+		if (rc) {
+			sbi_printf("S31: Redirect failed, advancing mepc past fault instruction\n");
+			regs->mepc += 4;
+			rc = 0;
+		}
 		msg = "load fault handler failed";
 		break;
 	case CAUSE_STORE_ACCESS:

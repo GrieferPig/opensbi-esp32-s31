@@ -14,6 +14,7 @@
 #include <sbi/sbi_bitops.h>
 #include <sbi/sbi_console.h>
 #include <sbi/sbi_csr_detect.h>
+#include <sbi/sbi_emulate_csr.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_hart_pmp.h>
@@ -28,6 +29,18 @@ extern void __sbi_expected_trap_hext(void);
 void (*sbi_hart_expected_trap)(void) = &__sbi_expected_trap;
 
 unsigned long hart_features_offset;
+
+/*
+ * Global override for privilege version, set by platforms whose
+ * csr_read_allowed mechanism (mtvec swap) doesn't work reliably.
+ * When set to non-zero, hart_detect_features skips trap-based CSR probing.
+ */
+unsigned int sbi_hart_priv_version_override;
+
+static bool hart_has_usable_h_extension(void)
+{
+	return !sbi_hart_priv_version_override && misa_extension('H');
+}
 
 static void mstatus_init(struct sbi_scratch *scratch)
 {
@@ -83,7 +96,7 @@ static void mstatus_init(struct sbi_scratch *scratch)
 #endif
 	}
 
-	if (misa_extension('H'))
+	if (hart_has_usable_h_extension())
 		csr_write(CSR_HSTATUS, 0);
 
 	if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMSTATEEN)) {
@@ -126,7 +139,7 @@ static void mstatus_init(struct sbi_scratch *scratch)
 			csr_write(CSR_SSTATEEN2, 0);
 			csr_write(CSR_SSTATEEN3, 0);
 		}
-		if (misa_extension('H')) {
+		if (hart_has_usable_h_extension()) {
 			csr_write64(CSR_HSTATEEN0, (uint64_t)0);
 			csr_write64(CSR_HSTATEEN1, (uint64_t)0);
 			csr_write64(CSR_HSTATEEN2, (uint64_t)0);
@@ -187,7 +200,7 @@ static void mstatus_init(struct sbi_scratch *scratch)
 
 	/* Disable S-mode paging */
 	if (misa_extension('S'))
-		csr_write(CSR_SATP, 0);
+		sbi_scsr_write(CSR_SATP, 0);
 }
 
 static int fp_init(struct sbi_scratch *scratch)
@@ -221,8 +234,12 @@ static int delegate_traps(struct sbi_scratch *scratch)
 		return 0;
 
 	/* Send M-mode interrupts and most exceptions to S-mode */
-	interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
-	interrupts |= sbi_pmu_irq_mask();
+	if (sbi_hart_priv_version_override)
+		interrupts = 0;
+	else {
+		interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
+		interrupts |= sbi_pmu_irq_mask();
+	}
 
 	exceptions = (1U << CAUSE_MISALIGNED_FETCH) | (1U << CAUSE_BREAKPOINT) |
 		     (1U << CAUSE_USER_ECALL);
@@ -239,7 +256,7 @@ static int delegate_traps(struct sbi_scratch *scratch)
 	 * The HS-mode will additionally handle supervisor calls (i.e. ecalls
 	 * from VS-mode), Guest page faults and Virtual interrupts.
 	 */
-	if (misa_extension('H')) {
+	if (hart_has_usable_h_extension()) {
 		exceptions |= (1U << CAUSE_VIRTUAL_SUPERVISOR_ECALL);
 		exceptions |= (1U << CAUSE_FETCH_GUEST_PAGE_FAULT);
 		exceptions |= (1U << CAUSE_LOAD_GUEST_PAGE_FAULT);
@@ -247,7 +264,8 @@ static int delegate_traps(struct sbi_scratch *scratch)
 		exceptions |= (1U << CAUSE_STORE_GUEST_PAGE_FAULT);
 	}
 
-	csr_write(CSR_MIDELEG, interrupts);
+	if (!sbi_hart_priv_version_override)
+		csr_write(CSR_MIDELEG, interrupts);
 	csr_write(CSR_MEDELEG, exceptions);
 
 	return 0;
@@ -260,8 +278,11 @@ void sbi_hart_delegation_dump(struct sbi_scratch *scratch,
 		/* No delegation possible as mideleg does not exist*/
 		return;
 
-	sbi_printf("%sMIDELEG%s: 0x%" PRILX "\n",
-		   prefix, suffix, csr_read(CSR_MIDELEG));
+	if (sbi_hart_priv_version_override)
+		sbi_printf("%sMIDELEG%s: 0x0\n", prefix, suffix);
+	else
+		sbi_printf("%sMIDELEG%s: 0x%" PRILX "\n",
+			   prefix, suffix, csr_read(CSR_MIDELEG));
 	sbi_printf("%sMEDELEG%s: 0x%" PRILX "\n",
 		   prefix, suffix, csr_read(CSR_MEDELEG));
 }
@@ -458,24 +479,13 @@ bool sbi_hart_has_csr(struct sbi_scratch *scratch, enum sbi_hart_csrs csr)
 	return __test_bit(csr, hfeatures->csrs);
 }
 
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 static unsigned long hart_pmp_get_allowed_addr(void)
 {
-	unsigned long val = 0;
-	struct sbi_trap_info trap = {0};
-
-	csr_write_allowed(CSR_PMPCFG0, &trap, 0);
-	if (trap.cause)
-		return 0;
-
-	csr_write_allowed(CSR_PMPADDR0, &trap, PMP_ADDR_MASK);
-	if (!trap.cause) {
-		val = csr_read_allowed(CSR_PMPADDR0, &trap);
-		if (trap.cause)
-			val = 0;
-	}
-
-	return val;
+	/* Hardcode for ESP32-S31 where probing might trap or read 0 */
+	return PMP_ADDR_MASK;
 }
+#endif
 
 static int hart_mhpm_get_allowed_bits(void)
 {
@@ -528,6 +538,16 @@ static int hart_detect_features(struct sbi_scratch *scratch, bool cold_boot)
 	rc = sbi_platform_extensions_init(sbi_platform_ptr(scratch), cold_boot);
 	if (rc)
 		return rc;
+
+	/*
+	 * If the platform has pre-set a privilege version (e.g., ESP32-S31
+	 * whose csr_read_allowed mechanism doesn't work), skip all trap-based
+	 * CSR probing and use the platform-provided version.
+	 */
+	if (sbi_hart_priv_version_override) {
+		hfeatures->priv_version = sbi_hart_priv_version_override;
+		goto skip_priv_detect;
+	}
 
 	if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMRNMI)) {
 		const struct sbi_platform *plat = sbi_platform_thishart_ptr();
@@ -613,14 +633,26 @@ static int hart_detect_features(struct sbi_scratch *scratch, bool cold_boot)
 	 * Detect the allowed address bits & granularity. At least PMPADDR0
 	 * should be implemented.
 	 */
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	hfeatures->pmp_log2gran = PMP_SHIFT;
+	hfeatures->pmp_addr_bits = 32;
+	hfeatures->pmp_count = 16;
+#else
 	val = hart_pmp_get_allowed_addr();
 	if (val) {
 		hfeatures->pmp_log2gran = sbi_ffs(val) + 2;
 		hfeatures->pmp_addr_bits = sbi_fls(val) + 1;
-		/* Detect number of PMP regions. At least PMPADDR0 should be implemented*/
-		__check_csr_64(CSR_PMPADDR0, 0, val, pmp_count, __pmp_skip);
+		/* Detect number of PMP regions. At least PMPADDR0 should be implemented.
+		 * Use __check_csr_16 for platforms (like ESP32-S31) that don't support
+		 * the expected-trap mechanism needed to probe beyond 16 entries. */
+		__check_csr_16(CSR_PMPADDR0, 0, val, pmp_count, __pmp_skip);
 	}
 __pmp_skip:
+	if (hfeatures->pmp_count == 0) {
+		hfeatures->pmp_count = 16;
+	}
+#endif
+
 	/* Detect number of MHPM counters */
 	__check_hpm_csr(CSR_MHPMCOUNTER3, mhpm_mask);
 	hfeatures->mhpm_bits = hart_mhpm_get_allowed_bits();
@@ -656,6 +688,7 @@ __pmp_skip:
 	/* Detect if hart supports Priv v1.12 */
 	__check_priv(CSR_MENVCFG,
 		     SBI_HART_PRIV_VER_1_11, SBI_HART_PRIV_VER_1_12);
+	(void)val;
 
 #undef __check_priv_csr
 
@@ -714,6 +747,7 @@ __pmp_skip:
 		__sbi_hart_update_extension(hfeatures,
 					SBI_HART_EXT_ZIHPM, true);
 
+skip_priv_detect:
 	/* Mark hart feature detection done */
 	hfeatures->detected = true;
 
@@ -754,7 +788,7 @@ int sbi_hart_init(struct sbi_scratch *scratch, bool cold_boot)
 	csr_write(CSR_MIP, 0);
 
 	if (cold_boot) {
-		if (misa_extension('H'))
+		if (hart_has_usable_h_extension())
 			sbi_hart_expected_trap = &__sbi_expected_trap_hext;
 
 		hart_features_offset = sbi_scratch_alloc_offset(
@@ -763,14 +797,21 @@ int sbi_hart_init(struct sbi_scratch *scratch, bool cold_boot)
 			return SBI_ENOMEM;
 	}
 
-	rc = hart_detect_features(scratch, cold_boot);
-	if (rc)
-		return rc;
-
-	if (cold_boot) {
-		rc = sbi_hart_pmp_init(scratch);
+	/*
+	 * On CLIC-only platforms (ESP32-S31), csr_read_allowed traps
+	 * don't work.  If the platform has pre-set a privilege version,
+	 * skip hart_detect_features and PMP init entirely.
+	 */
+	if (!sbi_hart_priv_version_override) {
+		rc = hart_detect_features(scratch, cold_boot);
 		if (rc)
 			return rc;
+
+		if (cold_boot) {
+			rc = sbi_hart_pmp_init(scratch);
+			if (rc)
+				return rc;
+		}
 	}
 
 	rc = delegate_traps(scratch);
@@ -817,13 +858,17 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 	val = INSERT_FIELD(val, MSTATUS_MPP, next_mode);
 	val = INSERT_FIELD(val, MSTATUS_MPIE, 0);
 #if __riscv_xlen == 32
-	if (misa_extension('H')) {
+	/*
+	 * On platforms where the misa CSR reports bogus H-extension
+	 * (like ESP32-S31), skip mstatush access entirely.
+	 */
+	if (hart_has_usable_h_extension()) {
 		valH = csr_read(CSR_MSTATUSH);
 		valH = INSERT_FIELD(valH, MSTATUSH_MPV, next_virt);
 		csr_write(CSR_MSTATUSH, valH);
 	}
 #else
-	if (misa_extension('H'))
+	if (hart_has_usable_h_extension())
 		val = INSERT_FIELD(val, MSTATUS_MPV, next_virt);
 #endif
 	csr_write(CSR_MSTATUS, val);
@@ -836,10 +881,10 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 			csr_write(CSR_VSIE, 0);
 			csr_write(CSR_VSATP, 0);
 		} else {
-			csr_write(CSR_STVEC, next_addr);
-			csr_write(CSR_SSCRATCH, 0);
-			csr_write(CSR_SIE, 0);
-			csr_write(CSR_SATP, 0);
+			sbi_scsr_write(CSR_STVEC, next_addr);
+			sbi_scsr_write(CSR_SSCRATCH, 0);
+			sbi_scsr_write(CSR_SIE, 0);
+			sbi_scsr_write(CSR_SATP, 0);
 		}
 	} else if (next_mode == PRV_U) {
 		if (misa_extension('N')) {
@@ -849,8 +894,15 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 		}
 	}
 
-	register unsigned long a0 asm("a0") = arg0;
-	register unsigned long a1 asm("a1") = arg1;
-	__asm__ __volatile__("mret" : : "r"(a0), "r"(a1));
+	register unsigned long a0_reg asm("a0") = arg0;
+	register unsigned long a1_reg asm("a1") = arg1;
+	__asm__ __volatile__(
+		"csrw mepc, %0\n\t"
+		"csrw mstatus, %1\n\t"
+		"mret\n\t"
+		:
+		: "r"(next_addr), "r"(val), "r"(a0_reg), "r"(a1_reg)
+		: "memory"
+	);
 	__builtin_unreachable();
 }

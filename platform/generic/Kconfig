@@ -105,6 +105,12 @@ config PLATFORM_SPACEMIT_K1
 	select FDT_HSM_SPACEMIT
 	default n
 
+config PLATFORM_ESPRESSIF_ESP32S31
+	bool "Espressif ESP32-S31 support"
+	select FDT_TIMER_MTIMER
+	select FDT_IPI_MSWI
+	default n
+
 config CPU_MIPS_P8700
 	bool
 	default n

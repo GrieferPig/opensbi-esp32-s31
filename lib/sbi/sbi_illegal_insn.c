@@ -54,9 +54,67 @@ static int system_opcode_insn(ulong insn, struct sbi_trap_regs *regs)
 	ulong prev_mode = sbi_mstatus_prev_mode(regs->mstatus);
 	ulong csr_val, new_csr_val;
 
+	/*
+	 * On ESP32-S31 only the standard S-mode interrupt CSRs still need
+	 * shadow emulation from M-mode. Trap/MMU CSRs are expected to work
+	 * through the normal CSR path.
+	 *
+	 * Unknown funct3 values (e.g. 0 or 4) are treated as read-only:
+	 * return the old shadow value, skip the write, advance mepc.
+	 * This avoids calling truly_illegal_insn→sbi_trap_redirect which
+	 * would itself trap on nested S-mode CSR accesses and cause a
+	 * double-fault lockup on ESP32-S31.
+	 */
+	if (sbi_scsr_needs_shadow(csr_num)) {
+		int funct3 = GET_RM(insn);
+		ulong old_val = sbi_scsr_shadow_read(csr_num);
+		ulong new_val = old_val;
+
+		switch (funct3) {
+		case CSRRW:
+			new_val = rs1_val;
+			sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		case CSRRS:
+			new_val = old_val | rs1_val;
+			if (rs1_num != 0)
+				sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		case CSRRC:
+			new_val = old_val & ~rs1_val;
+			if (rs1_num != 0)
+				sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		case CSRRWI:
+			new_val = rs1_num;
+			sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		case CSRRSI:
+			new_val = old_val | rs1_num;
+			if (rs1_num != 0)
+				sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		case CSRRCI:
+			new_val = old_val & ~rs1_num;
+			if (rs1_num != 0)
+				sbi_scsr_shadow_write(csr_num, new_val);
+			break;
+		default:
+			/* Reserved funct3 — treat as read-only, no write */
+			sbi_printf("SBI: S-CSR %#x unknown funct3=%d, "
+				   "insn=%#lx pc=%#lx\n",
+				   csr_num, funct3, insn, regs->mepc);
+			break;
+		}
+
+		SET_RD(insn, regs, old_val);
+		regs->mepc += 4;
+		return 0;
+	}
+
 	if (prev_mode == PRV_M) {
 		sbi_printf("%s: Failed to access CSR %#x from M-mode",
-			__func__, csr_num);
+			   __func__, csr_num);
 		return SBI_EFAIL;
 	}
 
@@ -160,9 +218,21 @@ int sbi_illegal_insn_handler(struct sbi_trap_context *tcntx)
 	 * so handling only 32-bit (or longer) illegal instructions also help
 	 * the case where MTVAL CSR contains instruction address for illegal
 	 * instruction trap.
+	 *
+	 * On ESP32-S31, mtval may contain the full 32-bit word at PC
+	 * rather than the actual instruction encoding.  If mepc is not
+	 * 4-byte aligned, the instruction MUST be 16-bit.  Simply skip it
+	 * (advance by 2) — attempting sbi_get_insn or sbi_trap_redirect
+	 * here would trigger nested S-mode CSR traps leading to a lockup.
 	 */
 
 	sbi_pmu_ctr_incr_fw(SBI_PMU_FW_ILLEGAL_INSN);
+
+	if (unlikely(regs->mepc & 0x2)) {
+		regs->mepc += 2;
+		return 0;
+	}
+
 	if (unlikely((insn & 3) != 3)) {
 		insn = sbi_get_insn(regs->mepc, &uptrap);
 		if (uptrap.cause)

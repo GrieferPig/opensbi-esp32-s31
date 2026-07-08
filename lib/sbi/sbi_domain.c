@@ -880,13 +880,25 @@ int sbi_domain_init(struct sbi_scratch *scratch, u32 cold_hartid)
 	SBI_INIT_LIST_HEAD(&domain_list);
 
 	if (!fw_single_region) {
+		/*
+		 * XIP: when text and data are in separate physical
+		 * address spaces (Flash vs SRAM), fw_rw_offset can be
+		 * huge and not a power of 2.  Treat this as a single
+		 * firmware region for domain purposes.
+		 */
+		if (scratch->fw_rw_offset > SBI_SCRATCH_SIZE &&
+		    (scratch->fw_rw_offset & (scratch->fw_rw_offset - 1)) != 0)
+			fw_single_region = true;
+
 		if (scratch->fw_rw_offset == 0 ||
-		    (scratch->fw_rw_offset & (scratch->fw_rw_offset - 1)) != 0) {
+		    ((scratch->fw_rw_offset & (scratch->fw_rw_offset - 1)) != 0
+		     && !fw_single_region)) {
 			sbi_printf("%s: fw_rw_offset is not a power of 2 (0x%lx)\n",
 				   __func__, scratch->fw_rw_offset);
 			return SBI_EINVAL;
 		}
-		if ((scratch->fw_start & (scratch->fw_rw_offset - 1)) != 0) {
+		if (!fw_single_region &&
+		    (scratch->fw_start & (scratch->fw_rw_offset - 1)) != 0) {
 			sbi_printf("%s: fw_start and fw_rw_offset not aligned\n",
 				   __func__);
 			return SBI_EINVAL;
@@ -919,7 +931,24 @@ int sbi_domain_init(struct sbi_scratch *scratch, u32 cold_hartid)
 	root.possible_harts = root_hmask;
 
 	/* Root domain firmware memory region */
-	if (fw_single_region) {
+	if (scratch->fw_rw_offset > SBI_SCRATCH_SIZE) {
+		/*
+		 * TODO: XIP PMP — Flash (0x40000000) and SRAM (0x2F040000)
+		 * are separate physical address spaces.  fw_rw_offset is a
+		 * huge VMA difference (~0xef010000), not a text-section size.
+		 * Both fw_size and fw_rw_offset are meaningless as region
+		 * boundaries in XIP mode.  Currently skipping all firmware
+		 * PMP regions: M-mode has unrestricted access to everything.
+		 *
+		 * Proper fix: use linker symbols (__data_flash_start,
+		 * _data_start, _data_end) to create two correct regions:
+		 *   - Flash text:  fw_start .. __data_flash_start   (R+X)
+		 *   - SRAM data:   _data_start .. _data_end          (R+W)
+		 * Flash must NOT be tagged writable — S31's PMA
+		 * hardwires Flash as read-only and PMP write-enable
+		 * on Flash will either be ignored or fault.
+		 */
+	} else if (fw_single_region) {
 		sbi_domain_memregion_init(scratch->fw_start, scratch->fw_size,
 					  (SBI_DOMAIN_MEMREGION_M_READABLE |
 					   SBI_DOMAIN_MEMREGION_M_WRITABLE |

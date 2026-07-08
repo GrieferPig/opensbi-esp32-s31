@@ -19,7 +19,7 @@
 	 * A4 <- temporary
 	 */
 
-	.align 3
+	.balign 0x40
 	.global __sbi_expected_trap
 __sbi_expected_trap:
 	/* Without H-extension so, MTVAL2 and MTINST CSRs and GVA not available */
@@ -37,7 +37,7 @@ __sbi_expected_trap:
 	csrw	CSR_MEPC, a4
 	mret
 
-	.align 3
+	.balign 0x40
 	.global __sbi_expected_trap_hext
 __sbi_expected_trap_hext:
 	/* With H-extension so, MTVAL2 and MTINST CSRs and GVA available */

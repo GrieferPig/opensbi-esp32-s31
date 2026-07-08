@@ -8,6 +8,7 @@
 #include <sbi/riscv_locks.h>
 #include <sbi/riscv_asm.h>
 #include <sbi/sbi_console.h>
+#include <sbi/sbi_emulate_csr.h>
 #include <sbi/sbi_hsm.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_hart_protection.h>
@@ -130,15 +131,15 @@ static int switch_to_next_domain_context(struct hart_context *ctx,
 	spin_unlock(&target_dom->assigned_harts_lock);
 
 	/* Save current CSR context and restore target domain's CSR context */
-	ctx->sstatus	= csr_swap(CSR_SSTATUS, dom_ctx->sstatus);
-	ctx->sie	= csr_swap(CSR_SIE, dom_ctx->sie);
-	ctx->stvec	= csr_swap(CSR_STVEC, dom_ctx->stvec);
-	ctx->sscratch	= csr_swap(CSR_SSCRATCH, dom_ctx->sscratch);
-	ctx->sepc	= csr_swap(CSR_SEPC, dom_ctx->sepc);
-	ctx->scause	= csr_swap(CSR_SCAUSE, dom_ctx->scause);
-	ctx->stval	= csr_swap(CSR_STVAL, dom_ctx->stval);
-	ctx->sip	= csr_swap(CSR_SIP, dom_ctx->sip);
-	ctx->satp	= csr_swap(CSR_SATP, dom_ctx->satp);
+	ctx->sstatus	= sbi_scsr_swap(CSR_SSTATUS, dom_ctx->sstatus);
+	ctx->sie	= sbi_scsr_swap(CSR_SIE, dom_ctx->sie);
+	ctx->stvec	= sbi_scsr_swap(CSR_STVEC, dom_ctx->stvec);
+	ctx->sscratch	= sbi_scsr_swap(CSR_SSCRATCH, dom_ctx->sscratch);
+	ctx->sepc	= sbi_scsr_swap(CSR_SEPC, dom_ctx->sepc);
+	ctx->scause	= sbi_scsr_swap(CSR_SCAUSE, dom_ctx->scause);
+	ctx->stval	= sbi_scsr_swap(CSR_STVAL, dom_ctx->stval);
+	ctx->sip	= sbi_scsr_swap(CSR_SIP, dom_ctx->sip);
+	ctx->satp	= sbi_scsr_swap(CSR_SATP, dom_ctx->satp);
 	if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_10)
 		ctx->scounteren = csr_swap(CSR_SCOUNTEREN, dom_ctx->scounteren);
 	if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_12)

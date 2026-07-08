@@ -19,6 +19,12 @@ else
 firmware-genflags-y += -DFW_TEXT_START=0x0
 endif
 
+ifdef FW_RW_START
+firmware-genflags-y += -DFW_RW_START=$(FW_RW_START)
+else
+firmware-genflags-y += -DFW_RW_START=0x0
+endif
+
 ifdef FW_FDT_PATH
 firmware-genflags-y += -DFW_FDT_PATH=\"$(FW_FDT_PATH)\"
 ifdef FW_FDT_PADDING
@@ -35,7 +41,7 @@ endif
 ifdef FW_JUMP_ADDR
 firmware-genflags-$(FW_JUMP) += -DFW_JUMP_ADDR=$(FW_JUMP_ADDR)
 endif
-ifdef FW_JUMP_FDT_OFFSET
+ifneq ($(FW_JUMP_FDT_OFFSET),)
 firmware-genflags-$(FW_JUMP) += -DFW_JUMP_FDT_OFFSET=$(FW_JUMP_FDT_OFFSET)
 endif
 ifdef FW_JUMP_FDT_ADDR
@@ -56,7 +62,7 @@ ifdef FW_PAYLOAD_ALIGN
 firmware-genflags-$(FW_PAYLOAD) += -DFW_PAYLOAD_ALIGN=$(FW_PAYLOAD_ALIGN)
 endif
 
-ifdef FW_PAYLOAD_FDT_OFFSET
+ifneq ($(FW_PAYLOAD_FDT_OFFSET),)
 firmware-genflags-$(FW_PAYLOAD) += -DFW_PAYLOAD_FDT_OFFSET=$(FW_PAYLOAD_FDT_OFFSET)
 endif
 ifdef FW_PAYLOAD_FDT_ADDR

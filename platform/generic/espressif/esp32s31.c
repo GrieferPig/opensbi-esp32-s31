@@ -1,0 +1,291 @@
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * ESP32-S31 minimal platform overrides for OpenSBI generic platform.
+ *
+ * CPU: RV32IMAFBCNSUX — S-mode, MMU (Sv32), FPU, CLIC interrupt controller.
+ * M-mode OpenSBI leaves external CLIC IRQs disabled; timer is handled by
+ * the generic DTS ACLINT/CLINT driver.
+ *
+ * This module:
+ *   1. Provides a minimal UART console
+ *   2. Overrides fw_platform_init to install ESP32-S31 platform hooks
+ *   3. Overrides misa detection to match real hardware extensions
+ */
+
+#include <platform_override.h>
+#include <sbi/riscv_io.h>
+#include <sbi/sbi_console.h>
+#include <sbi/sbi_platform.h>
+#include <sbi_utils/fdt/fdt_helper.h>
+#include <sbi/sbi_hart.h>
+#include <sbi/sbi_scratch.h>
+#include <sbi/sbi_emulate_csr.h>
+#include <sbi/sbi_hart_pmp.h>
+#include <sbi/sbi_math.h>
+#include <sbi/sbi_timer.h>
+
+extern struct sbi_platform platform;
+extern unsigned int sbi_hart_priv_version_override;
+
+/* --- UART console (UART0 at 0x2038A000 per ESP-IDF reg_base.h) --- */
+#define UART_BASE         0x2038A000UL
+#define UART_FIFO         (UART_BASE + 0x00)
+#define UART_STATUS       (UART_BASE + 0x1c)
+#define UART_TXFIFO_CNT   0x00FF0000UL
+#define UART_CLKDIV       (UART_BASE + 0x14)
+#define UART_CONF0        (UART_BASE + 0x20)
+#define UART_FIFO_LEN     128
+
+/* Core-local timer window observed on ESP32-S31. */
+#define S31_CLINT_BASE          0x10000000UL
+#define S31_MTIMECMP_LO         (S31_CLINT_BASE + 0x4000)
+#define S31_MTIMECMP_HI         (S31_CLINT_BASE + 0x4004)
+#define S31_MTIMECTL            (S31_CLINT_BASE + 0x4010)
+#define S31_MTIME_LO            (S31_CLINT_BASE + 0xbff8)
+#define S31_MTIME_HI            (S31_CLINT_BASE + 0xbffc)
+#define S31_TIMEBASE_HZ         320000000UL
+
+#define S31_MCLICCFG            0x10800000UL
+#define S31_CLICCFG_NMBITS_MASK (3U << 5)
+#define S31_CLICCFG_NMBITS_1    (1U << 5)
+#define S31_CLIC_CTRL_BASE      0x10801000UL
+#define S31_CLIC_WORD(id)       (S31_CLIC_CTRL_BASE + (4UL * (id)))
+#define S31_CLIC_ATTR_S_EDGE    0x42
+#define S31_CLIC_ATTR_M_EDGE    0xc2
+#define S31_CLIC_CTL_MAX        0xff
+
+static void raw_putc(char ch)
+{
+        while ((readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT) >=
+               (UART_FIFO_LEN << 16))
+                ;
+        writel_relaxed(ch, (void *)UART_FIFO);
+}
+
+static struct sbi_console_device esp32s31_console = {
+        .name         = "esp32s31_uart",
+        .console_putc = raw_putc,
+};
+
+static u64 esp32s31_timer_value(void)
+{
+        u32 lo, hi, tmp;
+
+        do {
+                hi = readl_relaxed((void *)S31_MTIME_HI);
+                lo = readl_relaxed((void *)S31_MTIME_LO);
+                tmp = readl_relaxed((void *)S31_MTIME_HI);
+        } while (hi != tmp);
+
+        return ((u64)hi << 32) | lo;
+}
+
+static void esp32s31_timer_event_stop(void)
+{
+        writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_HI);
+        writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_LO);
+        /* Clear pending edge-triggered ID7 after stopping timer */
+        volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
+        clic_tmr[0] = 0;
+}
+
+static void esp32s31_timer_event_start(u64 next_event)
+{
+        /* Ensure CLIC ID7 IE is set (M-mode edge-triggered timer) */
+        volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
+        clic_tmr[0] = 0;                       /* IP: clear edge latch */
+        clic_tmr[1] = 1;                       /* IE: ensure enabled */
+        clic_tmr[2] = S31_CLIC_ATTR_M_EDGE;    /* ATTR: M-mode, edge */
+
+        writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_HI);
+        writel_relaxed((u32)next_event, (void *)S31_MTIMECMP_LO);
+        writel_relaxed((u32)(next_event >> 32), (void *)S31_MTIMECMP_HI);
+}
+
+static struct sbi_timer_device esp32s31_timer = {
+        .name = "esp32s31-mtimer",
+        .timer_freq = S31_TIMEBASE_HZ,
+        .timer_value = esp32s31_timer_value,
+        .timer_event_start = esp32s31_timer_event_start,
+        .timer_event_stop = esp32s31_timer_event_stop,
+};
+
+/* --- misa override: RV32IMAFBCNSUX --- */
+static int esp32s31_misa_extension(char ext)
+{
+        switch (ext) {
+        case 'I': case 'M': case 'A': case 'F': case 'C':
+        case 'S': case 'U':
+                return 1;
+        default:
+                return 0;
+        }
+}
+
+static int esp32s31_misa_xlen(void)
+{
+        return 1;
+}
+
+/* --- Platform init --- */
+static int esp32s31_early_init(bool cold_boot)
+{
+        if (!cold_boot)
+                return 0;
+        /* UART already initialized by fw_platform_init; just setup console */
+        sbi_console_set_device(&esp32s31_console);
+
+        // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
+
+        /* On S31 only the standard S-mode interrupt CSRs need emulation.
+         * Keep the placeholder STVEC in the uncached PSRAM window. */
+        sbi_scsr_write(CSR_STVEC,    0xc0000003); /* CLIC MODE=3 */
+        sbi_scsr_write(CSR_SIE,      0);
+        /* Delegate all exceptions to S-mode.  ECALL from U-mode (bit 8) and
+         * S-mode (bit 9) MUST stay in M-mode for SBI.  Bit 11 (ECALL_M) is
+         * not delegatable per spec.  Delegate codes 0-7, 10, 12-15 only. */
+        csr_write(CSR_MEDELEG, 0xfcff);
+
+        /* Configure CPU_APM to allow S-mode access to peripherals (including CLIC) */
+        #define DR_REG_CPU_APM_BASE 0x20504C00
+        #define CPU_APM_REGION0_ADDR_START_REG (DR_REG_CPU_APM_BASE + 0x4)
+        #define CPU_APM_REGION0_ADDR_END_REG (DR_REG_CPU_APM_BASE + 0x8)
+        #define CPU_APM_REGION0_ATTR_REG (DR_REG_CPU_APM_BASE + 0xc)
+        #define CPU_APM_REGION_FILTER_EN_REG (DR_REG_CPU_APM_BASE + 0x0)
+        #define CPU_APM_FUNC_CTRL_REG (DR_REG_CPU_APM_BASE + 0xc4)
+        
+        writel(0, (void *)CPU_APM_REGION0_ADDR_START_REG);
+        writel(0xFFFFFFFF, (void *)CPU_APM_REGION0_ADDR_END_REG);
+        writel(0x7777, (void *)CPU_APM_REGION0_ATTR_REG);
+        writel(1, (void *)CPU_APM_REGION_FILTER_EN_REG);
+        writel(0x0F, (void *)CPU_APM_FUNC_CTRL_REG);
+
+        /* Configure CLIC thresholds to 0 to ensure interrupts are not masked. */
+        writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
+               S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
+        csr_write(0x347, 0); /* mintthresh */
+        csr_write(0x147, 0); /* sintthresh */
+
+        /* Configure CLIC M-mode interrupts for timer and software IPI.
+         * CLIC ID 3 = machine software interrupt (IPI across harts).
+         * CLIC ID 7 = machine timer interrupt (via SYSTIMER COMPx routing).
+         * With NMBITS=1, MODE must be written explicitly. */
+        volatile uint8_t *clic_swi_attr = (uint8_t *)0x1080100E;
+        volatile uint8_t *clic_swi_ctl  = (uint8_t *)0x1080100F;
+        volatile uint8_t *clic_swi_ie   = (uint8_t *)0x1080100D;
+        volatile uint8_t *clic_tmr_ip   = (uint8_t *)0x1080101C;
+        volatile uint8_t *clic_tmr_attr = (uint8_t *)0x1080101E;
+        volatile uint8_t *clic_tmr_ctl  = (uint8_t *)0x1080101F;
+        volatile uint8_t *clic_tmr_ie   = (uint8_t *)0x1080101D;
+        /* Software interrupt (ID 3): M-mode, edge-triggered, max priority */
+        *clic_swi_attr = S31_CLIC_ATTR_M_EDGE;
+        *clic_swi_ctl  = 0xFF;
+        *clic_swi_ie   = 1;
+        /* Timer interrupt (ID 7): M-mode, edge-triggered, max priority */
+        *clic_tmr_ip   = 0;
+        *clic_tmr_attr = 0xc0;
+        *clic_tmr_ctl  = 0xFF;
+        *clic_tmr_ie   = 1;
+
+        /* CLIC mode: CSR_TSELECT is readable but non-functional; force-disable SDTRIG */
+        sbi_hart_update_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SDTRIG, false);
+        return 0;
+}
+
+static int esp32s31_extensions_init(bool cold_boot)
+{
+        return 0;
+}
+
+static bool esp32s31_single_fw_region(void)
+{
+        /* XIP: Flash text + SRAM data are physically separate,
+         * fw_rw_offset is not a power of 2.  Report single region
+         * so sbi_domain_init skips the power-of-2 alignment check. */
+        return true;
+}
+
+static int esp32s31_noop_init(void)
+{
+        return 0;
+}
+
+static int esp32s31_timer_init(void)
+{
+        /*
+         * Re-assert CLIC configuration for the M-mode hardware timer.
+         * Linux receives timer events through explicit OpenSBI redirect
+         * from CLIC ID7 to synthetic S-mode local interrupt ID5.
+         */
+        {
+                volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
+
+                writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
+                       S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
+                clic_tmr[0] = 0;                        /* IP: clear pending */
+                clic_tmr[2] = S31_CLIC_ATTR_M_EDGE;    /* ATTR: M-mode, edge */
+                clic_tmr[3] = S31_CLIC_CTL_MAX;        /* CTL: max priority */
+                clic_tmr[1] = 1;                       /* IE: enable */
+        }
+        {
+                volatile uint8_t *clic_stmr = (uint8_t *)S31_CLIC_WORD(5);
+
+                clic_stmr[2] = S31_CLIC_ATTR_S_EDGE;  /* ATTR: S-mode, edge */
+                clic_stmr[3] = S31_CLIC_CTL_MAX;      /* CTL: max priority */
+                clic_stmr[1] = 0;                     /* IE: disabled */
+                clic_stmr[0] = 0;                     /* IP: clear */
+        }
+
+        writel_relaxed(1, (void *)S31_MTIMECTL);
+        esp32s31_timer_event_stop();
+        sbi_timer_set_device(&esp32s31_timer);
+
+        return 0;
+}
+
+static int esp32s31_final_init(bool cold_boot)
+{
+        if (cold_boot) {
+                /*
+                 * Ensure S-mode interrupts are enabled after mret.
+                 * sbi_hart_switch_mode preserves MSTATUS_SPIE, so
+                 * setting it here guarantees SIE ← 1 on mret to S-mode.
+                 * Without this, Linux enters S-mode with SIE=0 and
+                 * timer interrupts (CLIC ID 5) can never be serviced.
+                 */
+                csr_set(CSR_MSTATUS, MSTATUS_SPIE);
+        }
+
+        return 0;
+}
+
+static int esp32s31_platform_init(const void *fdt, int nodeoff,
+                                  const struct fdt_match *match)
+{
+        generic_platform_ops.single_fw_region = esp32s31_single_fw_region;
+        generic_platform_ops.nascent_init    = esp32s31_noop_init;
+        generic_platform_ops.early_init      = esp32s31_early_init;
+        generic_platform_ops.extensions_init = esp32s31_extensions_init;
+        generic_platform_ops.final_init      = esp32s31_final_init;
+        generic_platform_ops.misa_check_extension = esp32s31_misa_extension;
+        generic_platform_ops.misa_get_xlen   = esp32s31_misa_xlen;
+        generic_platform_ops.irqchip_init    = esp32s31_noop_init;
+        generic_platform_ops.timer_init      = esp32s31_timer_init;
+        generic_platform_ops.mpxy_init       = esp32s31_noop_init;
+        /* Skip trap-based CSR probing on CLIC-only platforms */
+        sbi_hart_priv_version_override = SBI_HART_PRIV_VER_1_10;
+        platform.hart_count = 1;
+        platform.hart_stack_size = SBI_PLATFORM_DEFAULT_HART_STACK_SIZE;
+        return 0;
+}
+
+static const struct fdt_match esp32s31_match[] = {
+        { .compatible = "espressif,esp32s31" },
+        { /* sentinel */ }
+};
+
+const struct fdt_driver esp32s31 = {
+        .match_table = esp32s31_match,
+        .init        = esp32s31_platform_init,
+};

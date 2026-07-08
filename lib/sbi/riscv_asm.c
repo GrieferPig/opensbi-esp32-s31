@@ -18,6 +18,17 @@
 int misa_extension_imp(char ext)
 {
 	unsigned long misa = csr_read(CSR_MISA);
+	const struct sbi_platform *plat = sbi_platform_thishart_ptr();
+
+	/*
+	 * If the platform provides a misa override (misa_check_extension),
+	 * use it in preference to the hardware misa CSR.  Some SoCs (e.g.
+	 * ESP32-S31) have a misa register with bogus bits that incorrectly
+	 * claim the presence of S or H extensions.
+	 */
+	if (plat && sbi_platform_ops(plat) &&
+	    sbi_platform_ops(plat)->misa_check_extension)
+		return sbi_platform_ops(plat)->misa_check_extension(ext);
 
 	if (misa) {
 		if ('A' <= ext && ext <= 'Z')
@@ -27,7 +38,7 @@ int misa_extension_imp(char ext)
 		return 0;
 	}
 
-	return sbi_platform_misa_extension(sbi_platform_thishart_ptr(), ext);
+	return sbi_platform_misa_extension(plat, ext);
 }
 
 int misa_xlen(void)

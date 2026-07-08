@@ -19,7 +19,7 @@
 	 * The boot HART id should be returned in 'a0'.
 	 */
 fw_boot_hart:
-	li	a0, -1
+	li	a0, 0     /* ESP32-S31: bootloader only launches hart 0 */
 	ret
 
 	.section .entry, "ax", %progbits

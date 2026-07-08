@@ -16,6 +16,8 @@
 
 #define BOOT_LOTTERY_ACQUIRED		1
 #define BOOT_STATUS_BOOT_HART_DONE	1
+#define S31_EARLY_TRAP_MAILBOX		0x2F07E000
+#define S31_EARLY_TRAP_MAGIC		0x53335450
 
 .macro	MOV_3R __d0, __s0, __d1, __s1, __d2, __s2
 	add	\__d0, \__s0, zero
@@ -33,8 +35,18 @@
 
 .macro CLEAR_MDT tmp
 #if __riscv_xlen == 32
+	/*
+	 * mstatush (CSR 0x310) is only present with H extension.
+	 * Check misa first to avoid illegal-instruction traps
+	 * on cores without H extension (e.g., ESP32-S31).
+	 */
+	csrr	\tmp, CSR_MISA
+	srli	\tmp, \tmp, ('H' - 'A')
+	andi	\tmp, \tmp, 0x1
+	beqz	\tmp, 993f
 	li 	\tmp, MSTATUSH_MDT
 	csrc	CSR_MSTATUSH, \tmp
+993:
 #else
 	li 	\tmp, MSTATUS_MDT
 	csrc	CSR_MSTATUS, \tmp
@@ -46,7 +58,27 @@
 	.globl _start
 	.globl _start_warm
 _start:
-	/* Find preferred boot HART id */
+	/* ESP32-S31: only hart 0 proceeds; others park in wfi */
+	csrr	a0, CSR_MHARTID
+	bnez	a0, _start_hang
+
+	/*
+	 * Flash XIP: copy .data from Flash (LMA) to SRAM (VMA) *before*
+	 * the lottery so _boot_lottery is zero.  Uses t0-t2 only.
+	 */
+	lla	t0, __data_flash_start
+	lla	t1, _data_start
+	lla	t2, _data_end
+	beq	t1, t2, _data_copy_early_done
+_data_copy_early_loop:
+	REG_L	t3, (t0)
+	REG_S	t3, (t1)
+	add	t0, t0, __SIZEOF_POINTER__
+	add	t1, t1, __SIZEOF_POINTER__
+	blt	t1, t2, _data_copy_early_loop
+_data_copy_early_done:
+
+	/* Restore bootloader-passed hartid / fdt_addr */
 	MOV_3R	s0, a0, s1, a1, s2, a2
 	call	fw_boot_hart
 	add	a6, a0, zero
@@ -93,11 +125,19 @@ _sc_fail:
 	addi	t0, t0, (__SIZEOF_LONG__ * 3)
 	blt	t0, t1, 2b
 _relocate_done:
-	/* At this point we are running from load address */
+	/* At this point we are running from link address */
 
 	/* Reset all registers except ra, a0, a1, a2, a3 and a4 for boot HART */
 	li	ra, 0
 	call	_reset_regs
+
+	/*
+	 * .data was already copied before the lottery so _boot_lottery and early
+	 * globals are usable.  Do not copy it again here: R_RISCV_RELATIVE
+	 * relocations above patch pointers inside .data, and a second copy would
+	 * overwrite those relocated values with the raw flash image.
+	 */
+_data_copy_done:
 
 	/* Zero-out BSS */
 	lla	s4, _bss_start
@@ -375,6 +415,7 @@ _start_warm:
 	beq	a5, zero, _skip_trap_handler_hyp
 	lla	a4, _trap_handler_hyp
 _skip_trap_handler_hyp:
+	ori	a4, a4, 3
 	csrw	CSR_MTVEC, a4
 
 	/* Clear MDT here again for all harts */
@@ -422,11 +463,29 @@ _hartid_to_scratch:
 	ret
 
 	.section .entry, "ax", %progbits
-	.align 3
+	.balign 0x40
 	.globl _start_hang
 _start_hang:
+	li	t0, S31_EARLY_TRAP_MAILBOX
+	li	t1, S31_EARLY_TRAP_MAGIC
+	REG_S	t1, 0(t0)
+	csrr	t1, CSR_MCAUSE
+	REG_S	t1, 4(t0)
+	csrr	t1, CSR_MEPC
+	REG_S	t1, 8(t0)
+	csrr	t1, CSR_MTVAL
+	REG_S	t1, 12(t0)
+	csrr	t1, CSR_MSTATUS
+	REG_S	t1, 16(t0)
+	csrr	t1, CSR_MTVEC
+	REG_S	t1, 20(t0)
+	csrr	t1, CSR_MSCRATCH
+	REG_S	t1, 24(t0)
+	csrr	t1, CSR_MHARTID
+	REG_S	t1, 28(t0)
+_start_hang_loop:
 	wfi
-	j	_start_hang
+	j	_start_hang_loop
 
 	.section .entry, "ax", %progbits
 	.align 3
@@ -631,8 +690,10 @@ memcmp:
 .endif
 	REG_S	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(gva))(sp)
 
-	/* We are ready to take another trap, clear MDT */
+	/* Clear MDT only when mstatush (and thus MDT bit) exists */
+	.if \have_mstatush
 	CLEAR_MDT t0
+	.endif
 .endm
 
 .macro	TRAP_SAVE_NMI_INFO
@@ -735,7 +796,7 @@ memcmp:
 .endm
 
 	.section .entry, "ax", %progbits
-	.align 3
+	.balign 0x40
 	.globl _trap_handler
 _trap_handler:
 	TRAP_SAVE_AND_SETUP_SP_T0
@@ -757,7 +818,7 @@ _trap_handler:
 	mret
 
 	.section .entry, "ax", %progbits
-	.align 3
+	.balign 0x40
 	.globl _trap_handler_hyp
 _trap_handler_hyp:
 	TRAP_SAVE_AND_SETUP_SP_T0

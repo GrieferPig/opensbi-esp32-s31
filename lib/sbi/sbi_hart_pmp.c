@@ -46,6 +46,10 @@ static int hart_pmp_read(pmp_t *pmp, unsigned int n)
 
 static int hart_pmp_write(pmp_t *pmp, unsigned int n)
 {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/* ESP32-S31 bootloader sets correct PMP; skip all writes */
+	return SBI_OK;
+#endif
 	int pmpcfg_csr, pmpcfg_shift, pmpaddr_csr;
 	unsigned long cfgmask, pmpcfg;
 
@@ -230,6 +234,11 @@ static bool is_valid_pmp_idx(unsigned int pmp_count, unsigned int pmp_idx)
 
 static int sbi_hart_smepmp_configure(struct sbi_scratch *scratch)
 {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/* ESP32-S31 bootloader already sets correct PMP covering 4 GB.
+	 * Rewriting it here would use the buggy -1UL NAPOT encoding. */
+	return 0;
+#endif
 	struct sbi_domain_memregion *reg;
 	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	unsigned int pmp_log2gran, pmp_bits;
@@ -368,6 +377,10 @@ static int sbi_hart_smepmp_unmap_range(struct sbi_scratch *scratch,
 
 static int sbi_hart_oldpmp_configure(struct sbi_scratch *scratch)
 {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/* ESP32-S31 bootloader already sets correct PMP covering 4 GB. */
+	return 0;
+#endif
 	struct sbi_domain_memregion *reg;
 	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	unsigned long pmp_addr, pmp_addr_max;
@@ -440,6 +453,16 @@ static struct sbi_hart_protection epmp_protection = {
 int sbi_hart_pmp_init(struct sbi_scratch *scratch)
 {
 	int rc;
+
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/*
+	 * Bootloader installs a single locked RWXL NAPOT entry covering the
+	 * whole 4 GB address space. Do not register any OpenSBI PMP-based
+	 * protection backend on ESP32-S31, otherwise later configure/unconfigure
+	 * or dynamic map/unmap paths may try to rewrite PMP state.
+	 */
+	return 0;
+#endif
 
 	if (sbi_hart_pmp_count(scratch)) {
 		if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SMEPMP)) {

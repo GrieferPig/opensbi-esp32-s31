@@ -175,6 +175,14 @@ void sbi_timer_event_stop(struct sbi_timer_event *ev);
 /** Start supervisor timer event on current HART */
 void sbi_timer_smode_event_start(u64 next_event);
 
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+/** Returns true when an S-mode timer event is ready to be redirected */
+bool sbi_timer_smode_event_pending(void);
+
+/** Clear the pending S-mode timer redirect state on the current HART */
+void sbi_timer_smode_event_clear_pending(void);
+#endif
+
 /** Process timer event for current HART */
 void sbi_timer_process(void);
 

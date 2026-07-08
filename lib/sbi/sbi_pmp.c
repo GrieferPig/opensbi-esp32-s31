@@ -53,10 +53,14 @@ int sbi_pmp_encode(pmp_t *pmp, unsigned long prot, unsigned long addr,
 	if (log2len == PMP_SHIFT) {
 		pmp->addr = (addr >> PMP_SHIFT);
 	} else {
+		unsigned long addrmask;
 		if (log2len == __riscv_xlen) {
-			pmp->addr = -1UL;
+			/* For a region covering the entire address space,
+			 * we need exactly (XLEN - PMP_SHIFT - 1) ones.
+			 * -1UL would set all bits, which is invalid NAPOT. */
+			addrmask = (1UL << (log2len - PMP_SHIFT - 1)) - 1;
+			pmp->addr = ((addr >> PMP_SHIFT) & ~addrmask) | addrmask;
 		} else {
-			unsigned long addrmask;
 			addrmask = (1UL << (log2len - PMP_SHIFT)) - 1;
 			pmp->addr = ((addr >> PMP_SHIFT) & ~addrmask);
 			pmp->addr |= (addrmask >> 1);
@@ -83,11 +87,12 @@ int sbi_pmp_decode(pmp_t *pmp, unsigned long *prot_out, unsigned long *addr_out,
 	/* decode PMP address */
 	if ((prot & PMP_A) == PMP_A_NAPOT) {
 		addr = pmp->addr;
-		if (addr == -1UL) {
+		t1 = ctz(~addr);
+		if (t1 + PMP_SHIFT + 1 == __riscv_xlen || addr == -1UL) {
+			/* Full-address-space NAPOT encoding (or legacy -1UL) */
 			addr	= 0;
 			len	= __riscv_xlen;
 		} else {
-			t1	= ctz(~addr);
 			addr	= (addr & ~((1UL << t1) - 1)) << PMP_SHIFT;
 			len	= (t1 + PMP_SHIFT + 1);
 		}

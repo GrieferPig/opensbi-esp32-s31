@@ -177,3 +177,129 @@ int sbi_emulate_csr_write(int csr_num, struct sbi_trap_regs *regs,
 
 	return ret;
 }
+
+/*
+ * Shadow S-mode CSR storage for the subset of S-mode CSRs that still trap
+ * from M-mode on ESP32-S31. CSR numbers 0x100-0x1FF map to indices 0-255.
+ */
+static ulong sbi_scsr_shadow[256];
+
+bool sbi_scsr_needs_shadow(int csr_num)
+{
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	switch (csr_num) {
+	case CSR_SIE:
+	case CSR_SIP:
+#if __riscv_xlen == 32
+	case CSR_SIEH:
+	case CSR_SIPH:
+#endif
+		return true;
+	default:
+		return false;
+	}
+#else
+	return false;
+#endif
+}
+
+void sbi_scsr_write(int csr_num, ulong val)
+{
+	if (sbi_scsr_needs_shadow(csr_num)) {
+		sbi_scsr_shadow_write(csr_num, val);
+		return;
+	}
+
+	switch (csr_num) {
+	case CSR_SSTATUS:
+		csr_write(CSR_SSTATUS, val);
+		break;
+	case CSR_STVEC:
+		csr_write(CSR_STVEC, val);
+		break;
+	case CSR_SSCRATCH:
+		csr_write(CSR_SSCRATCH, val);
+		break;
+	case CSR_SEPC:
+		csr_write(CSR_SEPC, val);
+		break;
+	case CSR_SCAUSE:
+		csr_write(CSR_SCAUSE, val);
+		break;
+	case CSR_STVAL:
+		csr_write(CSR_STVAL, val);
+		break;
+	case CSR_SATP:
+		csr_write(CSR_SATP, val);
+		break;
+	default:
+		break;
+	}
+}
+
+ulong sbi_scsr_read(int csr_num)
+{
+	if (sbi_scsr_needs_shadow(csr_num))
+		return sbi_scsr_shadow_read(csr_num);
+
+	switch (csr_num) {
+	case CSR_SSTATUS:
+		return csr_read(CSR_SSTATUS);
+	case CSR_STVEC:
+		return csr_read(CSR_STVEC);
+	case CSR_SSCRATCH:
+		return csr_read(CSR_SSCRATCH);
+	case CSR_SEPC:
+		return csr_read(CSR_SEPC);
+	case CSR_SCAUSE:
+		return csr_read(CSR_SCAUSE);
+	case CSR_STVAL:
+		return csr_read(CSR_STVAL);
+	case CSR_SATP:
+		return csr_read(CSR_SATP);
+	default:
+		return 0;
+	}
+}
+
+ulong sbi_scsr_swap(int csr_num, ulong val)
+{
+	if (sbi_scsr_needs_shadow(csr_num)) {
+		ulong old = sbi_scsr_shadow_read(csr_num);
+
+		sbi_scsr_shadow_write(csr_num, val);
+		return old;
+	}
+
+	switch (csr_num) {
+	case CSR_SSTATUS:
+		return csr_swap(CSR_SSTATUS, val);
+	case CSR_STVEC:
+		return csr_swap(CSR_STVEC, val);
+	case CSR_SSCRATCH:
+		return csr_swap(CSR_SSCRATCH, val);
+	case CSR_SEPC:
+		return csr_swap(CSR_SEPC, val);
+	case CSR_SCAUSE:
+		return csr_swap(CSR_SCAUSE, val);
+	case CSR_STVAL:
+		return csr_swap(CSR_STVAL, val);
+	case CSR_SATP:
+		return csr_swap(CSR_SATP, val);
+	default:
+		return 0;
+	}
+}
+
+void sbi_scsr_shadow_write(int csr_num, ulong val)
+{
+	if (csr_num >= 0x100 && csr_num < 0x200)
+		sbi_scsr_shadow[csr_num - 0x100] = val;
+}
+
+ulong sbi_scsr_shadow_read(int csr_num)
+{
+	if (csr_num >= 0x100 && csr_num < 0x200)
+		return sbi_scsr_shadow[csr_num - 0x100];
+	return 0;
+}

@@ -204,52 +204,16 @@ void sbi_store_loop(u8 *buffer, ulong addr, ulong len,
 
 ulong sbi_get_insn(ulong mepc, struct sbi_trap_info *trap)
 {
-	register ulong tinfo asm("a3");
-	register ulong ttmp asm("a4");
-	register ulong mstatus = 0;
-	register ulong mtvec = (ulong)sbi_hart_expected_trap;
-	ulong insn = 0;
-
 	trap->cause = 0;
+	trap->tval = 0;
+	trap->tval2 = 0;
+	trap->tinst = 0;
+	trap->gva = 0;
 
-	asm volatile(
-	    "add %[tinfo], %[taddr], zero\n"
-	    "csrrw %[mtvec], " STR(CSR_MTVEC) ", %[mtvec]\n"
-	    "csrrs %[mstatus], " STR(CSR_MSTATUS) ", %[mprv]\n"
-	    "lhu %[insn], (%[addr])\n"
-	    "andi %[ttmp], %[insn], 3\n"
-	    "addi %[ttmp], %[ttmp], -3\n"
-	    "bne %[ttmp], zero, 2f\n"
-	    "lhu %[ttmp], 2(%[addr])\n"
-	    "sll %[ttmp], %[ttmp], 16\n"
-	    "add %[insn], %[insn], %[ttmp]\n"
-	    "2: csrw " STR(CSR_MSTATUS) ", %[mstatus]\n"
-	    "csrw " STR(CSR_MTVEC) ", %[mtvec]"
-	    : [mstatus] "+&r"(mstatus), [mtvec] "+&r"(mtvec),
-	      [tinfo] "+&r"(tinfo), [ttmp] "+&r"(ttmp),
-	      [insn] "=&r"(insn)
-	    : [mprv] "r"(MSTATUS_MPRV | MSTATUS_MXR),
-	      [taddr] "r"((ulong)trap), [addr] "r"(mepc)
-	    : "memory");
-
-	switch (trap->cause) {
-	case CAUSE_LOAD_ACCESS:
-		trap->cause = CAUSE_FETCH_ACCESS;
-		trap->tinst = 0UL;
-		break;
-	case CAUSE_LOAD_PAGE_FAULT:
-		trap->cause = CAUSE_FETCH_PAGE_FAULT;
-		trap->tinst = 0UL;
-		break;
-	case CAUSE_LOAD_GUEST_PAGE_FAULT:
-		trap->cause = CAUSE_FETCH_GUEST_PAGE_FAULT;
-		if (trap->tinst != INSN_PSEUDO_VS_LOAD &&
-		    trap->tinst != INSN_PSEUDO_VS_STORE)
-			trap->tinst = 0UL;
-		break;
-	default:
-		break;
+	const uint16_t *addr = (const uint16_t *)mepc;
+	uint32_t insn = addr[0];
+	if ((insn & 3) == 3) {
+		insn |= ((uint32_t)addr[1]) << 16;
 	}
-
 	return insn;
 }
