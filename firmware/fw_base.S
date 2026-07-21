@@ -63,7 +63,7 @@ _start:
 	bnez	a0, _start_hang
 
 	/*
-	 * Flash XIP: copy .data from Flash (LMA) to SRAM (VMA) *before*
+	 * Flash XIP: copy .data from Flash (LMA) to cached PSRAM (VMA) *before*
 	 * the lottery so _boot_lottery is zero.  Uses t0-t2 only.
 	 */
 	lla	t0, __data_flash_start
