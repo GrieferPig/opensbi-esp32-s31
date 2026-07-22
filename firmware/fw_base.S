@@ -761,9 +761,15 @@ memcmp:
 
 .macro	TRAP_RESTORE_MEPC_MSTATUS have_mstatush
 	/*
-	 * Restore MSTATUS and MEPC CSRs starting with MSTATUS/H to set MDT
-	 * flags since we can not take a trap now or MEPC would be cloberred
+	 * Restore MCAUSE, MSTATUS and MEPC.  ESP32-S31 CLIC embeds the former
+	 * interrupt priority in MCAUSE, and mret copies it back to MINTSTATUS.
+	 * This must precede MSTATUS, matching ESP-IDF's CLIC return sequence.
 	 */
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	REG_L	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(cause))(a0)
+	csrw	CSR_MCAUSE, t0
+#endif
+	/* Start with MSTATUS/H to set MDT when that extension is present. */
 	.if \have_mstatush
 	REG_L	t0, SBI_TRAP_REGS_OFFSET(mstatusH)(a0)
 	csrw	CSR_MSTATUSH, t0

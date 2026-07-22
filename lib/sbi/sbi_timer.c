@@ -40,14 +40,18 @@ static const struct sbi_timer_device *timer_dev = NULL;
 #define S31_CLIC_INT_ATTR		2
 #define S31_CLIC_INT_CTL		3
 #define S31_CLIC_ATTR_S_EDGE		0x42
-#define S31_CLIC_CTL_MAX		0xff
+#define S31_CLIC_CTL_S_DEFAULT		0x3f
+#define S31_CSR_SINTSTATUS		0xdb1
+#define S31_SINTSTATUS_SIL_MASK		0xff00
+#define S31_TIMER_RETRY_HZ		10000
 
 static void s31_trigger_smode_timer_irq(void)
 {
 	volatile uint8_t *clic_stmr = (uint8_t *)S31_CLIC_WORD(S31_CLIC_S_TIMER_ID);
 
 	clic_stmr[S31_CLIC_INT_ATTR] = S31_CLIC_ATTR_S_EDGE;
-	clic_stmr[S31_CLIC_INT_CTL] = S31_CLIC_CTL_MAX;
+	/* Match Linux's default external IRQ level and keep hard IRQs non-nested. */
+	clic_stmr[S31_CLIC_INT_CTL] = S31_CLIC_CTL_S_DEFAULT;
 	clic_stmr[S31_CLIC_INT_IP] = 0;
 	clic_stmr[S31_CLIC_INT_IP] = 1;
 }
@@ -289,6 +293,21 @@ static void sbi_timer_smode_event_callback(struct sbi_timer_event *ev,
 	 */
 	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
 #ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		/*
+		 * Do not inject an S timer while an S-mode CLIC interrupt level is
+		 * still active.  S31 can otherwise accept the pending timer on the
+		 * same boundary as the outer sret and inherit the stale maximum SIL.
+		 * Retry from M-mode after 100 us; no driver-specific masking is
+		 * required and the original supervisor deadline remains expired.
+		 */
+		if (csr_read(S31_CSR_SINTSTATUS) & S31_SINTSTATUS_SIL_MASK) {
+			u64 retry_delta = timer_dev->timer_freq / S31_TIMER_RETRY_HZ;
+
+			restart->required = true;
+			restart->next_event = sbi_timer_value() +
+					      (retry_delta ? retry_delta : 1);
+			return;
+		}
 		s31_trigger_smode_timer_irq();
 #else
 		csr_set(CSR_MIP, MIP_STIP);
@@ -369,7 +388,7 @@ void sbi_timer_process(void)
 	}
 
 	while (!sbi_list_empty(&restart_list)) {
-		ev = sbi_list_first_entry(&tstate->event_list, struct sbi_timer_event, head);
+		ev = sbi_list_first_entry(&restart_list, struct sbi_timer_event, head);
 		sbi_list_del(&ev->head);
 		__sbi_timer_event_start(tstate, ev, ev->time_stamp);
 	}
