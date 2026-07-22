@@ -16,7 +16,10 @@
 #include <platform_override.h>
 #include <sbi/riscv_io.h>
 #include <sbi/sbi_console.h>
+#include <sbi/sbi_ecall.h>
+#include <sbi/sbi_ecall_interface.h>
 #include <sbi/sbi_platform.h>
+#include <sbi/sbi_string.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_scratch.h>
@@ -45,6 +48,25 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_MTIME_LO            (S31_CLINT_BASE + 0xbff8)
 #define S31_MTIME_HI            (S31_CLINT_BASE + 0xbffc)
 #define S31_TIMEBASE_HZ         320000000UL
+
+/* Auto-suspend is configured by the ESP-IDF bootloader before OpenSBI runs. */
+#define S31_ROM_FLASH_WRITE      0x2f800168UL
+#define S31_ROM_FLASH_ERASE      0x2f800174UL
+#define S31_ROM_FLASH_UNLOCK     0x2f800170UL
+#define S31_FLASH_SIZE           0x01000000UL
+#define S31_PSRAM_LINUX_START    0x50000000UL
+#define S31_PSRAM_LINUX_END      0x50ef0000UL
+/* Not owned by Linux or the bootloader app after the firmware handoff. */
+#define S31_DRAM_FLASH_BUFFER    0x2f07ff00UL
+
+#define S31_SBI_EXT_FLASH        0x09000000UL
+#define S31_SBI_FLASH_WRITE      0
+#define S31_SBI_FLASH_ERASE      1
+
+typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
+                                     s32 length);
+typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
+typedef int (*s31_rom_flash_unlock_t)(void);
 
 #define S31_MCLICCFG            0x10800000UL
 #define S31_CLICCFG_NMBITS_MASK (3U << 5)
@@ -193,9 +215,60 @@ static int esp32s31_early_init(bool cold_boot)
         return 0;
 }
 
+static int esp32s31_flash_ecall(unsigned long extid, unsigned long funcid,
+                                struct sbi_trap_regs *regs,
+                                struct sbi_ecall_return *out)
+{
+        u32 address = regs->a0;
+        u32 length = regs->a2;
+        int ret;
+
+        if (!length || address >= S31_FLASH_SIZE ||
+            length > S31_FLASH_SIZE - address)
+                return SBI_ERR_INVALID_PARAM;
+
+	ret = ((s31_rom_flash_unlock_t)S31_ROM_FLASH_UNLOCK)();
+	if (ret) {
+		out->value = ret;
+                return SBI_ERR_FAILED;
+        }
+
+        switch (funcid) {
+        case S31_SBI_FLASH_WRITE:
+		if ((address | regs->a1 | length) & 3 || length > 32 ||
+		    regs->a1 < S31_PSRAM_LINUX_START ||
+		    regs->a1 >= S31_PSRAM_LINUX_END ||
+		    length > S31_PSRAM_LINUX_END - regs->a1)
+			return SBI_ERR_INVALID_PARAM;
+                sbi_memcpy((void *)S31_DRAM_FLASH_BUFFER,
+                           (const void *)regs->a1, length);
+                ret = ((s31_rom_flash_write_t)S31_ROM_FLASH_WRITE)(
+                        address, (const u32 *)S31_DRAM_FLASH_BUFFER, length);
+                break;
+        case S31_SBI_FLASH_ERASE:
+                if ((address | length) & 0xfff)
+                        return SBI_ERR_INVALID_PARAM;
+                ret = ((s31_rom_flash_erase_t)S31_ROM_FLASH_ERASE)(address,
+                                                                    length);
+                break;
+        default:
+                return SBI_ERR_NOT_SUPPORTED;
+        }
+
+	out->value = ret;
+        return ret ? SBI_ERR_FAILED : SBI_SUCCESS;
+}
+
+static struct sbi_ecall_extension esp32s31_flash_ecall_ext = {
+        .name           = "s31flash",
+        .extid_start    = S31_SBI_EXT_FLASH,
+        .extid_end      = S31_SBI_EXT_FLASH,
+        .handle         = esp32s31_flash_ecall,
+};
+
 static int esp32s31_extensions_init(bool cold_boot)
 {
-        return 0;
+	return generic_extensions_init(cold_boot);
 }
 
 static bool esp32s31_single_fw_region(void)
@@ -246,7 +319,14 @@ static int esp32s31_timer_init(void)
 
 static int esp32s31_final_init(bool cold_boot)
 {
-        if (cold_boot) {
+	int ret;
+
+	if (cold_boot) {
+		/* Register after generic platform setup, before SBI dispatch starts. */
+		ret = sbi_ecall_register_extension(&esp32s31_flash_ecall_ext);
+		if (ret)
+			return ret;
+
                 /*
                  * Ensure S-mode interrupts are enabled after mret.
                  * sbi_hart_switch_mode preserves MSTATUS_SPIE, so
