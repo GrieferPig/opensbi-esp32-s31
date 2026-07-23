@@ -75,8 +75,6 @@ typedef int (*s31_rom_flash_unlock_t)(void);
 #define S31_CLIC_WORD(id)       (S31_CLIC_CTRL_BASE + (4UL * (id)))
 #define S31_CLIC_ATTR_S_EDGE    0x42
 #define S31_CLIC_ATTR_M_EDGE    0xc2
-#define S31_CLIC_CTL_MAX        0xff
-
 static void raw_putc(char ch)
 {
         while ((readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT) >=
@@ -114,11 +112,12 @@ static void esp32s31_timer_event_stop(void)
 
 static void esp32s31_timer_event_start(u64 next_event)
 {
-        /* Ensure CLIC ID7 IE is set (M-mode edge-triggered timer) */
+        /* Deliver the hardware compare directly to S-mode as local ID7. */
         volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
         clic_tmr[0] = 0;                       /* IP: clear edge latch */
         clic_tmr[1] = 1;                       /* IE: ensure enabled */
-        clic_tmr[2] = S31_CLIC_ATTR_M_EDGE;    /* ATTR: M-mode, edge */
+        clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
+        clic_tmr[3] = 0x3f;                    /* Same level as S peripherals */
 
         writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_HI);
         writel_relaxed((u32)next_event, (void *)S31_MTIMECMP_LO);
@@ -164,10 +163,12 @@ static int esp32s31_early_init(bool cold_boot)
          * Keep the placeholder STVEC in the reserved cached PSRAM window. */
         sbi_scsr_write(CSR_STVEC,    0x50f00003); /* CLIC MODE=3 */
         sbi_scsr_write(CSR_SIE,      0);
-        /* Delegate all exceptions to S-mode.  ECALL from U-mode (bit 8) and
-         * S-mode (bit 9) MUST stay in M-mode for SBI.  Bit 11 (ECALL_M) is
-         * not delegatable per spec.  Delegate codes 0-7, 10, 12-15 only. */
-        csr_write(CSR_MEDELEG, 0xfcff);
+        /*
+         * Request delegation of U-mode ECALL (bit 8) to Linux while keeping
+         * S-mode ECALL (bit 9) in M-mode for SBI.  S31 WARL may reject bit 8;
+         * OpenSBI then redirects it and rebuilds scause without M metadata.
+         */
+        csr_write(CSR_MEDELEG, 0xfdff);
 
         /* Configure CPU_APM to allow S-mode access to peripherals (including CLIC) */
         #define DR_REG_CPU_APM_BASE 0x20504C00
@@ -204,10 +205,10 @@ static int esp32s31_early_init(bool cold_boot)
         *clic_swi_attr = S31_CLIC_ATTR_M_EDGE;
         *clic_swi_ctl  = 0xFF;
         *clic_swi_ie   = 1;
-        /* Timer interrupt (ID 7): M-mode, edge-triggered, max priority */
+        /* Timer interrupt (ID 7): direct S-mode edge interrupt. */
         *clic_tmr_ip   = 0;
-        *clic_tmr_attr = 0xc0;
-        *clic_tmr_ctl  = 0xFF;
+        *clic_tmr_attr = S31_CLIC_ATTR_S_EDGE;
+        *clic_tmr_ctl  = 0x3f;
         *clic_tmr_ie   = 1;
 
         /* CLIC mode: CSR_TSELECT is readable but non-functional; force-disable SDTRIG */
@@ -286,30 +287,17 @@ static int esp32s31_noop_init(void)
 
 static int esp32s31_timer_init(void)
 {
-        /*
-         * Re-assert CLIC configuration for the M-mode hardware timer.
-         * Linux receives timer events through explicit OpenSBI redirect
-         * from CLIC ID7 to synthetic S-mode local interrupt ID5.
-         */
+        /* Re-assert direct S-mode delivery for the hardware timer. */
         {
                 volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
 
                 writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
                        S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
                 clic_tmr[0] = 0;                        /* IP: clear pending */
-                clic_tmr[2] = S31_CLIC_ATTR_M_EDGE;    /* ATTR: M-mode, edge */
-                clic_tmr[3] = S31_CLIC_CTL_MAX;        /* CTL: max priority */
+                clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
+                clic_tmr[3] = 0x3f;
                 clic_tmr[1] = 1;                       /* IE: enable */
         }
-        {
-                volatile uint8_t *clic_stmr = (uint8_t *)S31_CLIC_WORD(5);
-
-                clic_stmr[2] = S31_CLIC_ATTR_S_EDGE;  /* ATTR: S-mode, edge */
-                clic_stmr[3] = S31_CLIC_CTL_MAX;      /* CTL: max priority */
-                clic_stmr[1] = 0;                     /* IE: disabled */
-                clic_stmr[0] = 0;                     /* IP: clear */
-        }
-
         writel_relaxed(1, (void *)S31_MTIMECTL);
         esp32s31_timer_event_stop();
         sbi_timer_set_device(&esp32s31_timer);

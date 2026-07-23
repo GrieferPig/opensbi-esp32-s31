@@ -204,7 +204,12 @@ int sbi_trap_redirect(struct sbi_trap_regs *regs,
 #ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 		sbi_scsr_write(CSR_STVAL, trap->tval);
 		sbi_scsr_write(CSR_SEPC, regs->mepc);
-		sbi_scsr_write(CSR_SCAUSE, trap->cause);
+		/*
+		 * M-CLIC metadata above the cause code is not valid S-CLIC
+		 * return state.  Copying it makes the eventual sret restore the
+		 * M-origin 0xff sentinel into SIL.
+		 */
+		sbi_scsr_write(CSR_SCAUSE, trap->cause & 0xfff);
 
 		/* On S31 only the interrupt CSRs still need shadow emulation. */
 		regs->mepc = sbi_scsr_read(CSR_STVEC) & ~MTVEC_MODE;
@@ -331,15 +336,6 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 			rc = sbi_trap_aia_irq();
 		else
 			rc = sbi_trap_nonaia_irq(mcause & 0xfff);
-#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-		/*
-		 * On S31 the M-mode hardware timer is CLIC ID7, while Linux
-		 * consumes the event as S-mode CLIC ID5.  The timer callback
-		 * asserts ID5 directly; never redirect through stvec from here
-		 * because ID7 can preempt S-mode while Linux is saving/restoring
-		 * the interrupted U/S context.
-		 */
-#endif
 		msg = "unhandled local interrupt";
 		goto trap_done;
 	}
@@ -402,6 +398,18 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 trap_done:
 	if (rc)
 		sbi_trap_error(msg, rc, tcntx);
+
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/*
+	 * Only CLIC interrupts carry a priority stack entry that must be
+	 * restored through mcause before mret.  Synchronous traps (notably the
+	 * frequent S-mode timer SBI ecall) carry cross-privilege metadata that
+	 * is not a restorable interrupt level.  Returning it verbatim leaks
+	 * the S31 0xff sentinel into SIL and eventually blocks all S IRQs.
+	 */
+	if (!(tcntx->trap.cause & MCAUSE_IRQ_MASK))
+		tcntx->trap.cause &= 0xfff;
+#endif
 
 	if (sbi_mstatus_prev_mode(regs->mstatus) != PRV_M)
 		sbi_sse_process_pending_events(regs);
