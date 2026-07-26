@@ -324,18 +324,24 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	const struct sbi_trap_info *trap = &tcntx->trap;
 	struct sbi_trap_regs *regs = &tcntx->regs;
-	ulong mcause = tcntx->trap.cause;
+	/*
+	 * Keep S31's raw CLIC return token in tcntx->trap.cause.  Dispatch uses a
+	 * separate logical cause so firmware code can never accidentally feed a
+	 * masked ID back to mret in place of the hardware nesting state.
+	 */
+	ulong raw_mcause = tcntx->trap.cause;
+	ulong logical_mcause = raw_mcause;
 
 	/* Update trap context pointer */
 	tcntx->prev_context = sbi_trap_get_context(scratch);
 	sbi_trap_set_context(scratch, tcntx);
 
-	if (mcause & MCAUSE_IRQ_MASK) {
+	if (raw_mcause & MCAUSE_IRQ_MASK) {
 		if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
 					   SBI_HART_EXT_SMAIA))
 			rc = sbi_trap_aia_irq();
 		else
-			rc = sbi_trap_nonaia_irq(mcause & 0xfff);
+			rc = sbi_trap_nonaia_irq(logical_mcause & 0xfff);
 		msg = "unhandled local interrupt";
 		goto trap_done;
 	}
@@ -346,9 +352,9 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 	 * the standard code range so that the switch cases still match.
 	 * Use 0xfff to preserve CLIC interrupt IDs up to 47 (external IRQs
 	 * are IDs 16-47).  Do NOT use & 0xF which truncates IDs >= 16. */
-	mcause &= 0xfff;
+	logical_mcause &= 0xfff;
 
-	switch (mcause) {
+	switch (logical_mcause) {
 	case CAUSE_ILLEGAL_INSTRUCTION:
 		rc  = sbi_illegal_insn_handler(tcntx);
 		msg = "illegal instruction handler failed";

@@ -75,6 +75,8 @@ typedef int (*s31_rom_flash_unlock_t)(void);
 #define S31_CLIC_WORD(id)       (S31_CLIC_CTRL_BASE + (4UL * (id)))
 #define S31_CLIC_ATTR_S_EDGE    0x42
 #define S31_CLIC_ATTR_M_EDGE    0xc2
+#define S31_CLIC_SINGLE_LEVEL   0x3f
+#define S31_CSR_MINTTHRESH      0x347
 static void raw_putc(char ch)
 {
         while ((readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT) >=
@@ -114,10 +116,19 @@ static void esp32s31_timer_event_start(u64 next_event)
 {
         /* Deliver the hardware compare directly to S-mode as local ID7. */
         volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
+
+        /*
+         * Re-assert the machine-side gate while servicing every timer SBI
+         * call.  S31 can restore mintthresh to 0x0f on the later privilege
+         * return, so this is only M-mode defence in depth; Linux's sanitized
+         * non-nested scause token is the persistent SIL=0xff protection.
+         */
+        csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
+
         clic_tmr[0] = 0;                       /* IP: clear edge latch */
         clic_tmr[1] = 1;                       /* IE: ensure enabled */
         clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
-        clic_tmr[3] = 0x3f;                    /* Same level as S peripherals */
+        clic_tmr[3] = S31_CLIC_SINGLE_LEVEL;   /* Same level as S peripherals */
 
         writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_HI);
         writel_relaxed((u32)next_event, (void *)S31_MTIMECMP_LO);
@@ -184,10 +195,23 @@ static int esp32s31_early_init(bool cold_boot)
         writel(1, (void *)CPU_APM_REGION_FILTER_EN_REG);
         writel(0x0F, (void *)CPU_APM_FUNC_CTRL_REG);
 
-        /* Configure CLIC thresholds to 0 to ensure interrupts are not masked. */
+        /*
+         * S31 has machine-only CLIC inputs whose MODE and IE bits are
+         * hardwired (ID21 is observable as MODE=M, IE=1).  A machine
+         * interrupt taken while Linux runs in S-mode creates the hardware
+         * SIL=0xff sentinel, even when every programmable source uses the
+         * same ctl value.  Keep the machine threshold at that single level:
+         * all M interrupts are masked, so none can nest across S-mode.
+         *
+         * ESP-IDF defines INTTHRESH_STANDARD=1 for S31, so the machine
+         * threshold is CSR 0x347 and contains the left-aligned threshold
+         * byte directly.  The S-mode threshold remains zero so the direct S
+         * interrupts at ctl=0x3f are accepted when no S handler is active;
+         * their active level then naturally blocks same-level nesting.
+         */
         writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
                S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
-        csr_write(0x347, 0); /* mintthresh */
+        csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
         csr_write(0x147, 0); /* sintthresh */
 
         /* Configure CLIC M-mode interrupts for timer and software IPI.
@@ -201,14 +225,19 @@ static int esp32s31_early_init(bool cold_boot)
         volatile uint8_t *clic_tmr_attr = (uint8_t *)0x1080101E;
         volatile uint8_t *clic_tmr_ctl  = (uint8_t *)0x1080101F;
         volatile uint8_t *clic_tmr_ie   = (uint8_t *)0x1080101D;
-        /* Software interrupt (ID 3): M-mode, edge-triggered, max priority */
+        /*
+         * Use one effective CLIC level (ctl=0x3f) for every interrupt.
+         * Privilege still determines M/S delivery, but the controller no
+         * longer exposes priority-based nesting within either mode.
+         */
         *clic_swi_attr = S31_CLIC_ATTR_M_EDGE;
-        *clic_swi_ctl  = 0xFF;
-        *clic_swi_ie   = 1;
+        *clic_swi_ctl  = S31_CLIC_SINGLE_LEVEL;
+        /* This platform currently exposes one hart and has no IPI device. */
+        *clic_swi_ie   = 0;
         /* Timer interrupt (ID 7): direct S-mode edge interrupt. */
         *clic_tmr_ip   = 0;
         *clic_tmr_attr = S31_CLIC_ATTR_S_EDGE;
-        *clic_tmr_ctl  = 0x3f;
+        *clic_tmr_ctl  = S31_CLIC_SINGLE_LEVEL;
         *clic_tmr_ie   = 1;
 
         /* CLIC mode: CSR_TSELECT is readable but non-functional; force-disable SDTRIG */
@@ -295,7 +324,7 @@ static int esp32s31_timer_init(void)
                        S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
                 clic_tmr[0] = 0;                        /* IP: clear pending */
                 clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
-                clic_tmr[3] = 0x3f;
+                clic_tmr[3] = S31_CLIC_SINGLE_LEVEL;
                 clic_tmr[1] = 1;                       /* IE: enable */
         }
         writel_relaxed(1, (void *)S31_MTIMECTL);
@@ -310,6 +339,9 @@ static int esp32s31_final_init(bool cold_boot)
 	int ret;
 
 	if (cold_boot) {
+		/* Best-effort M-side gate in the last platform hook before Linux. */
+		csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
+
 		/* Register after generic platform setup, before SBI dispatch starts. */
 		ret = sbi_ecall_register_extension(&esp32s31_flash_ecall_ext);
 		if (ret)
