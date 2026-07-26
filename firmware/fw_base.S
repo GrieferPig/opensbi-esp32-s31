@@ -16,7 +16,7 @@
 
 #define BOOT_LOTTERY_ACQUIRED		1
 #define BOOT_STATUS_BOOT_HART_DONE	1
-#define S31_EARLY_TRAP_MAILBOX		0x2F07E000
+#define S31_EARLY_TRAP_MAILBOX		0x2F07AFA0
 #define S31_EARLY_TRAP_MAGIC		0x53335450
 
 .macro	MOV_3R __d0, __s0, __d1, __s1, __d2, __s2
@@ -64,7 +64,7 @@ _start:
 	bne	a0, t0, _start_hang
 
 	/*
-	 * Flash XIP: copy .data from Flash (LMA) to uncached PSRAM (VMA) *before*
+	 * Flash XIP: copy .data from Flash (LMA) to cached PSRAM (VMA) *before*
 	 * the lottery so _boot_lottery is zero.  Uses t0-t2 only.
 	 */
 	lla	t0, __data_flash_start
