@@ -54,8 +54,8 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_ROM_FLASH_ERASE      0x2f800174UL
 #define S31_ROM_FLASH_UNLOCK     0x2f800170UL
 #define S31_FLASH_SIZE           0x01000000UL
-#define S31_PSRAM_LINUX_START    0x50000000UL
-#define S31_PSRAM_LINUX_END      0x50ef0000UL
+#define S31_PSRAM_LINUX_START    0xc0000000UL
+#define S31_PSRAM_LINUX_END      0xc0ef0000UL
 /* Not owned by Linux or the bootloader app after the firmware handoff. */
 #define S31_DRAM_FLASH_BUFFER    0x2f07ff00UL
 
@@ -171,8 +171,8 @@ static int esp32s31_early_init(bool cold_boot)
         // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
         /* On S31 only the standard S-mode interrupt CSRs need emulation.
-         * Keep the placeholder STVEC in the reserved cached PSRAM window. */
-        sbi_scsr_write(CSR_STVEC,    0x50f00003); /* CLIC MODE=3 */
+         * Keep the placeholder STVEC in the reserved uncached PSRAM window. */
+        sbi_scsr_write(CSR_STVEC,    0xc0f00003); /* CLIC MODE=3 */
         sbi_scsr_write(CSR_SIE,      0);
         /*
          * Request delegation of U-mode ECALL (bit 8) to Linux while keeping
@@ -303,7 +303,7 @@ static int esp32s31_extensions_init(bool cold_boot)
 
 static bool esp32s31_single_fw_region(void)
 {
-        /* XIP: Flash text + cached PSRAM data are physically separate,
+        /* XIP: Flash text + uncached PSRAM data are physically separate,
          * fw_rw_offset is not a power of 2.  Report single region
          * so sbi_domain_init skips the power-of-2 alignment check. */
         return true;

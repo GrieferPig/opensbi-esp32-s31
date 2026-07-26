@@ -58,12 +58,13 @@
 	.globl _start
 	.globl _start_warm
 _start:
-	/* ESP32-S31: only hart 0 proceeds; others park in wfi */
+	/* ESP32-S31: the ESP-IDF factory app owns hart 0; OpenSBI owns hart 1. */
 	csrr	a0, CSR_MHARTID
-	bnez	a0, _start_hang
+	li	t0, 1
+	bne	a0, t0, _start_hang
 
 	/*
-	 * Flash XIP: copy .data from Flash (LMA) to cached PSRAM (VMA) *before*
+	 * Flash XIP: copy .data from Flash (LMA) to uncached PSRAM (VMA) *before*
 	 * the lottery so _boot_lottery is zero.  Uses t0-t2 only.
 	 */
 	lla	t0, __data_flash_start
