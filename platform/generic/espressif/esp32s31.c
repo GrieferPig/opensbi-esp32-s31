@@ -27,6 +27,8 @@
 #include <sbi/sbi_hart_pmp.h>
 #include <sbi/sbi_math.h>
 #include <sbi/sbi_timer.h>
+#include <sbi/sbi_trap.h>
+#include <sbi/sbi_unpriv.h>
 
 extern struct sbi_platform platform;
 extern unsigned int sbi_hart_priv_version_override;
@@ -63,10 +65,28 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_FLASH_WRITE      0
 #define S31_SBI_FLASH_ERASE      1
 
+#define S31_SBI_EXT_HOSTED       0x09000001UL
+#define S31_SBI_HOSTED_TX        0
+#define S31_SBI_HOSTED_RX_ACK    1
+#define S31_SBI_HOSTED_H1_READY  2
+#define S31_HOSTED_BASE          0x2f062f80UL
+#define S31_HOSTED_H0_RING       (S31_HOSTED_BASE + 64)
+#define S31_HOSTED_H1_RING       (S31_HOSTED_BASE + 256)
+#define S31_HOSTED_H1_SLOTS      (S31_HOSTED_BASE + 0x8800)
+#define S31_HOSTED_SLOT_SIZE     1920UL
+#define S31_HOSTED_DATA_SIZE     1912UL
+#define S31_HOSTED_SLOT_COUNT    16UL
+#define S31_HOSTED_DB_H0         0x2058701cUL
+#define S31_ROM_CACHE_WRITEBACK  0x2f8005f0UL
+#define S31_ROM_CACHE_WB_INV_ALL 0x2f800604UL
+#define S31_CACHE_MAP_L1_DCACHE  (1U << 4)
+
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
+typedef int (*s31_rom_cache_writeback_t)(u32 map, u32 address, u32 size);
+typedef int (*s31_rom_cache_all_t)(u32 map);
 
 #define S31_MCLICCFG            0x10800000UL
 #define S31_CLICCFG_NMBITS_MASK (3U << 5)
@@ -217,7 +237,7 @@ static int esp32s31_early_init(bool cold_boot)
         /* Configure CLIC M-mode interrupts for timer and software IPI.
          * CLIC ID 3 = machine software interrupt (IPI across harts).
          * CLIC ID 7 = machine timer interrupt (via SYSTIMER COMPx routing).
-         * With NMBITS=1, MODE must be written explicitly. */
+         * MODE must be written explicitly. */
         volatile uint8_t *clic_swi_attr = (uint8_t *)0x1080100E;
         volatile uint8_t *clic_swi_ctl  = (uint8_t *)0x1080100F;
         volatile uint8_t *clic_swi_ie   = (uint8_t *)0x1080100D;
@@ -296,6 +316,85 @@ static struct sbi_ecall_extension esp32s31_flash_ecall_ext = {
         .handle         = esp32s31_flash_ecall,
 };
 
+static int esp32s31_hosted_ecall(unsigned long extid, unsigned long funcid,
+				 struct sbi_trap_regs *regs,
+				 struct sbi_ecall_return *out)
+{
+	volatile u32 *ring;
+	struct sbi_trap_info trap = { 0 };
+	u8 frame[S31_HOSTED_DATA_SIZE];
+	u32 producer, consumer, index;
+	volatile u8 *slot;
+	u32 count;
+
+	switch (funcid) {
+	case S31_SBI_HOSTED_TX:
+		if (!regs->a1 || regs->a1 > sizeof(frame))
+			return SBI_ERR_INVALID_PARAM;
+
+		sbi_load_loop(frame, regs->a0, regs->a1, &trap);
+		if (trap.cause)
+			return SBI_ERR_INVALID_ADDRESS;
+
+		ring = (volatile u32 *)S31_HOSTED_H1_RING;
+		producer = ring[0];
+		consumer = ring[16];
+		if (producer - consumer >= S31_HOSTED_SLOT_COUNT)
+			return SBI_ERR_NO_SHMEM;
+
+		index = producer & (S31_HOSTED_SLOT_COUNT - 1);
+		slot = (volatile u8 *)(S31_HOSTED_H1_SLOTS +
+				      index * S31_HOSTED_SLOT_SIZE);
+		sbi_memcpy((void *)(slot + 8), frame, regs->a1);
+		*(volatile u16 *)(slot + 4) = regs->a1;
+		slot[6] = 0;
+		*(volatile u32 *)slot = producer + 1;
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		ring[0] = producer + 1;
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		((s31_rom_cache_writeback_t)S31_ROM_CACHE_WRITEBACK)(
+			S31_CACHE_MAP_L1_DCACHE,
+			(u32)(unsigned long)slot,
+			S31_HOSTED_SLOT_SIZE);
+		((s31_rom_cache_writeback_t)S31_ROM_CACHE_WRITEBACK)(
+			S31_CACHE_MAP_L1_DCACHE,
+			(u32)(unsigned long)ring,
+			64);
+		((s31_rom_cache_all_t)S31_ROM_CACHE_WB_INV_ALL)(
+			S31_CACHE_MAP_L1_DCACHE);
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		writel(1, (void *)S31_HOSTED_DB_H0);
+		out->value = producer + 1;
+		return SBI_SUCCESS;
+
+	case S31_SBI_HOSTED_RX_ACK:
+		ring = (volatile u32 *)S31_HOSTED_H0_RING;
+		producer = ring[0];
+		consumer = ring[16];
+		count = regs->a0;
+		if (!count || count > producer - consumer)
+			return SBI_ERR_INVALID_PARAM;
+		ring[16] = consumer + count;
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		return SBI_SUCCESS;
+
+	case S31_SBI_HOSTED_H1_READY:
+		*(volatile u32 *)(S31_HOSTED_BASE + 12) |= 2;
+		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		return SBI_SUCCESS;
+	default:
+		return SBI_ERR_NOT_SUPPORTED;
+	}
+}
+
+static struct sbi_ecall_extension esp32s31_hosted_ecall_ext = {
+	.name		= "s31host",
+	.extid_start	= S31_SBI_EXT_HOSTED,
+	.extid_end	= S31_SBI_EXT_HOSTED,
+	.handle		= esp32s31_hosted_ecall,
+};
+
 static int esp32s31_extensions_init(bool cold_boot)
 {
 	return generic_extensions_init(cold_boot);
@@ -327,6 +426,27 @@ static int esp32s31_timer_init(void)
                 clic_tmr[3] = S31_CLIC_SINGLE_LEVEL;
                 clic_tmr[1] = 1;                       /* IE: enable */
         }
+
+        /*
+         * Pre-configure external CLIC slots (16-47) for S-mode delivery.
+         * Linux's CLIC driver writes through the S-mode sclicbase window
+         * (0x10A00000), which cannot change MODE for slots still in M-mode.
+         * Set MODE=S here from M-mode so Linux can later enable/disable IE.
+         */
+        {
+                const u8 s_level_attr = 0x40; /* MODE=S, TRIG=level, SHV=0 */
+                int i;
+
+                for (i = 16; i <= 47; i++) {
+                        volatile uint8_t *ext = (uint8_t *)S31_CLIC_WORD(i);
+
+                        ext[0] = 0;                     /* IP: clear */
+                        ext[2] = s_level_attr;          /* ATTR: S-mode, level */
+                        ext[3] = S31_CLIC_SINGLE_LEVEL; /* CTL: level 1 */
+                        ext[1] = 0;                     /* IE: off (Linux enables) */
+                }
+        }
+
         writel_relaxed(1, (void *)S31_MTIMECTL);
         esp32s31_timer_event_stop();
         sbi_timer_set_device(&esp32s31_timer);
@@ -344,6 +464,9 @@ static int esp32s31_final_init(bool cold_boot)
 
 		/* Register after generic platform setup, before SBI dispatch starts. */
 		ret = sbi_ecall_register_extension(&esp32s31_flash_ecall_ext);
+		if (ret)
+			return ret;
+		ret = sbi_ecall_register_extension(&esp32s31_hosted_ecall_ext);
 		if (ret)
 			return ret;
 
