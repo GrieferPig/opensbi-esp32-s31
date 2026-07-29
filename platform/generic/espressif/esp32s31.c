@@ -76,18 +76,23 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_HOSTED_SLOT_SIZE     1920UL
 #define S31_HOSTED_DATA_SIZE     1912UL
 #define S31_HOSTED_SLOT_COUNT    16UL
-#define S31_HOSTED_DB_H0         0x2058701cUL
-#define S31_ROM_CACHE_WRITEBACK  0x2f8005f0UL
-#define S31_ROM_CACHE_WB_INV_ALL 0x2f800604UL
-#define S31_CACHE_MAP_L1_DCACHE  (1U << 4)
+#define S31_HOSTED_DB_H0         0x2058601cUL
 
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
-typedef int (*s31_rom_cache_writeback_t)(u32 map, u32 address, u32 size);
-typedef int (*s31_rom_cache_all_t)(u32 map);
 
+static void s31_hosted_cache_writeback(const volatile void *address, u32 size)
+{
+	/*
+	 * 0x2f... is internal HP SRAM and is directly shared by both harts.
+	 * CACHE_SYNC only applies to external cached aliases.
+	 */
+	(void)address;
+	(void)size;
+	__asm__ __volatile__("fence rw, rw" ::: "memory");
+}
 #define S31_MCLICCFG            0x10800000UL
 #define S31_CLICCFG_NMBITS_MASK (3U << 5)
 #define S31_CLICCFG_NMBITS_1    (1U << 5)
@@ -352,18 +357,8 @@ static int esp32s31_hosted_ecall(unsigned long extid, unsigned long funcid,
 		__asm__ __volatile__("fence rw, rw" ::: "memory");
 		ring[0] = producer + 1;
 		__asm__ __volatile__("fence rw, rw" ::: "memory");
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
-		((s31_rom_cache_writeback_t)S31_ROM_CACHE_WRITEBACK)(
-			S31_CACHE_MAP_L1_DCACHE,
-			(u32)(unsigned long)slot,
-			S31_HOSTED_SLOT_SIZE);
-		((s31_rom_cache_writeback_t)S31_ROM_CACHE_WRITEBACK)(
-			S31_CACHE_MAP_L1_DCACHE,
-			(u32)(unsigned long)ring,
-			64);
-		((s31_rom_cache_all_t)S31_ROM_CACHE_WB_INV_ALL)(
-			S31_CACHE_MAP_L1_DCACHE);
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		s31_hosted_cache_writeback(slot, S31_HOSTED_SLOT_SIZE);
+		s31_hosted_cache_writeback(ring, 64);
 		writel(1, (void *)S31_HOSTED_DB_H0);
 		out->value = producer + 1;
 		return SBI_SUCCESS;
@@ -376,7 +371,7 @@ static int esp32s31_hosted_ecall(unsigned long extid, unsigned long funcid,
 		if (!count || count > producer - consumer)
 			return SBI_ERR_INVALID_PARAM;
 		ring[16] = consumer + count;
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
+		s31_hosted_cache_writeback(ring + 16, 64);
 		return SBI_SUCCESS;
 
 	case S31_SBI_HOSTED_H1_READY:
