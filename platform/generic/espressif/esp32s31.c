@@ -26,6 +26,7 @@
 #include <sbi/sbi_emulate_csr.h>
 #include <sbi/sbi_hart_pmp.h>
 #include <sbi/sbi_math.h>
+#include <sbi/sbi_system.h>
 #include <sbi/sbi_timer.h>
 #include <sbi/sbi_trap.h>
 #include <sbi/sbi_unpriv.h>
@@ -78,6 +79,10 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_HOSTED_SLOT_COUNT    16UL
 #define S31_HOSTED_DB_H0         0x2058601cUL
 
+#define S31_HOSTED_CTRL_POWER_OFF 5
+#define S31_HOSTED_CTRL_RESTART   6
+#define S31_HOSTED_SYSTEM_REQUEST (S31_HOSTED_BASE + 56)
+
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
@@ -93,6 +98,79 @@ static void s31_hosted_cache_writeback(const volatile void *address, u32 size)
 	(void)size;
 	__asm__ __volatile__("fence rw, rw" ::: "memory");
 }
+
+/*
+ * Publish a system request through the dedicated control-block mailbox.  It
+ * must not share the payload ring: Linux may leave that ring full or quiesced
+ * after shutting down the Hosted network device.
+ */
+static void s31_hosted_system_request(u8 type)
+{
+	writel_relaxed(type, (void *)S31_HOSTED_SYSTEM_REQUEST);
+	__asm__ __volatile__("fence rw, rw" ::: "memory");
+	writel_relaxed(1, (void *)S31_HOSTED_DB_H0);
+}
+
+static void __noreturn esp32s31_reboot(void)
+{
+	while (readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT)
+		;
+
+	/*
+	 * Hart0 owns the IDF runtime and performs the complete S31 restart
+	 * sequence, including UART/cache flush, clock switching and both cores.
+	 */
+	s31_hosted_system_request(S31_HOSTED_CTRL_RESTART);
+
+	for (;;)
+		__asm__ __volatile__("wfi");
+}
+
+static void __noreturn esp32s31_poweroff(void)
+{
+	while (readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT)
+		;
+
+	/*
+	 * PMU setup is owned by the IDF runtime on hart0.  Ask it to enter deep
+	 * sleep with no wake source instead of duplicating undocumented analog
+	 * and power-domain programming in OpenSBI.
+	 */
+	s31_hosted_system_request(S31_HOSTED_CTRL_POWER_OFF);
+
+	/* The successful IDF deep-sleep path powers this hart down. */
+	for (;;)
+		__asm__ __volatile__("wfi");
+}
+
+static int esp32s31_system_reset_check(u32 type, u32 reason)
+{
+	(void)reason;
+
+	switch (type) {
+	case SBI_SRST_RESET_TYPE_SHUTDOWN:
+	case SBI_SRST_RESET_TYPE_COLD_REBOOT:
+	case SBI_SRST_RESET_TYPE_WARM_REBOOT:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static void esp32s31_system_reset(u32 type, u32 reason)
+{
+	(void)reason;
+
+	if (type == SBI_SRST_RESET_TYPE_SHUTDOWN)
+		esp32s31_poweroff();
+	esp32s31_reboot();
+}
+
+static struct sbi_system_reset_device esp32s31_reset = {
+	.name = "esp32s31-reset",
+	.system_reset_check = esp32s31_system_reset_check,
+	.system_reset = esp32s31_system_reset,
+};
 #define S31_MCLICCFG            0x10800000UL
 #define S31_CLICCFG_NMBITS_MASK (3U << 5)
 #define S31_CLICCFG_NMBITS_1    (1U << 5)
@@ -464,6 +542,7 @@ static int esp32s31_final_init(bool cold_boot)
 		ret = sbi_ecall_register_extension(&esp32s31_hosted_ecall_ext);
 		if (ret)
 			return ret;
+		sbi_system_reset_add_device(&esp32s31_reset);
 
                 /*
                  * Ensure S-mode interrupts are enabled after mret.
