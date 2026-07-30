@@ -34,14 +34,12 @@
 extern struct sbi_platform platform;
 extern unsigned int sbi_hart_priv_version_override;
 
-/* --- UART console (UART0 at 0x2038A000 per ESP-IDF reg_base.h) --- */
+/* Linux earlycon UART0 (0x2038a000, already configured by the IDF loader). */
 #define UART_BASE         0x2038A000UL
 #define UART_FIFO         (UART_BASE + 0x00)
 #define UART_STATUS       (UART_BASE + 0x1c)
 #define UART_TXFIFO_CNT   0x00FF0000UL
-#define UART_CLKDIV       (UART_BASE + 0x14)
-#define UART_CONF0        (UART_BASE + 0x20)
-#define UART_FIFO_LEN     128
+#define UART_TXFIFO_SIZE  127UL
 
 /* Core-local timer window observed on ESP32-S31. */
 #define S31_CLINT_BASE          0x10000000UL
@@ -58,7 +56,8 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_ROM_FLASH_UNLOCK     0x2f800170UL
 #define S31_FLASH_SIZE           0x01000000UL
 #define S31_PSRAM_LINUX_START    0x50000000UL
-#define S31_PSRAM_LINUX_END      0x50ef0000UL
+/* Exclusive end of the 15 MiB Linux memory node; OpenSBI RW starts here. */
+#define S31_PSRAM_LINUX_END      0x50f00000UL
 /* Not owned by Linux or the bootloader app after the firmware handoff. */
 #define S31_DRAM_FLASH_BUFFER    0x2f07ff00UL
 
@@ -70,6 +69,11 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_HOSTED_TX        0
 #define S31_SBI_HOSTED_RX_ACK    1
 #define S31_SBI_HOSTED_H1_READY  2
+#define S31_SBI_EXT_COPROC       0x09000002UL
+#define S31_SBI_COPROC_SWITCH    0
+#define S31_SBI_COPROC_SAVE      1
+#define S31_SBI_COPROC_RESTORE   2
+#define S31_COPROC_STATE_SIZE    256UL
 #define S31_HOSTED_BASE          0x2f062f80UL
 #define S31_HOSTED_H0_RING       (S31_HOSTED_BASE + 64)
 #define S31_HOSTED_H1_RING       (S31_HOSTED_BASE + 256)
@@ -183,7 +187,7 @@ static struct sbi_system_reset_device esp32s31_reset = {
 static void raw_putc(char ch)
 {
         while ((readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT) >=
-               (UART_FIFO_LEN << 16))
+               (UART_TXFIFO_SIZE << 16))
                 ;
         writel_relaxed(ch, (void *)UART_FIFO);
 }
@@ -268,7 +272,7 @@ static int esp32s31_early_init(bool cold_boot)
 {
         if (!cold_boot)
                 return 0;
-        /* UART already initialized by fw_platform_init; just setup console */
+        /* Reuse the exact UART that Linux takes over as its early console. */
         sbi_console_set_device(&esp32s31_console);
 
         // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
@@ -468,6 +472,48 @@ static struct sbi_ecall_extension esp32s31_hosted_ecall_ext = {
 	.handle		= esp32s31_hosted_ecall,
 };
 
+extern void s31_coproc_save(void *state);
+extern void s31_coproc_restore(const void *state);
+
+static bool s31_coproc_state_valid(unsigned long address)
+{
+	return !(address & 0xf) &&
+	       address >= S31_PSRAM_LINUX_START &&
+	       address <= S31_PSRAM_LINUX_END - S31_COPROC_STATE_SIZE;
+}
+
+static int esp32s31_coproc_ecall(unsigned long extid, unsigned long funcid,
+				 struct sbi_trap_regs *regs,
+				 struct sbi_ecall_return *out)
+{
+	if (!s31_coproc_state_valid(regs->a0))
+		return SBI_ERR_INVALID_ADDRESS;
+
+	switch (funcid) {
+	case S31_SBI_COPROC_SWITCH:
+		if (!s31_coproc_state_valid(regs->a1))
+			return SBI_ERR_INVALID_ADDRESS;
+		s31_coproc_save((void *)regs->a0);
+		s31_coproc_restore((const void *)regs->a1);
+		return SBI_SUCCESS;
+	case S31_SBI_COPROC_SAVE:
+		s31_coproc_save((void *)regs->a0);
+		return SBI_SUCCESS;
+	case S31_SBI_COPROC_RESTORE:
+		s31_coproc_restore((const void *)regs->a0);
+		return SBI_SUCCESS;
+	default:
+		return SBI_ERR_NOT_SUPPORTED;
+	}
+}
+
+static struct sbi_ecall_extension esp32s31_coproc_ecall_ext = {
+	.name		= "s31cprc",
+	.extid_start	= S31_SBI_EXT_COPROC,
+	.extid_end	= S31_SBI_EXT_COPROC,
+	.handle		= esp32s31_coproc_ecall,
+};
+
 static int esp32s31_extensions_init(bool cold_boot)
 {
 	return generic_extensions_init(cold_boot);
@@ -540,6 +586,9 @@ static int esp32s31_final_init(bool cold_boot)
 		if (ret)
 			return ret;
 		ret = sbi_ecall_register_extension(&esp32s31_hosted_ecall_ext);
+		if (ret)
+			return ret;
+		ret = sbi_ecall_register_extension(&esp32s31_coproc_ecall_ext);
 		if (ret)
 			return ret;
 		sbi_system_reset_add_device(&esp32s31_reset);
