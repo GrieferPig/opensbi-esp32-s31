@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Copyright (c) 2019 Western Digital Corporation or its affiliates.
- * Modified for ESP32-S31 Flash XIP + cached PSRAM data.
+ * Modified for ESP32-S31 Flash XIP + internal HP-SRAM data.
  *
  * Authors:
  *   Anup Patel <anup.patel@wdc.com>
@@ -10,8 +10,8 @@
 
 	ASSERT(FW_TEXT_START == 0x40030000,
 	       "ESP32-S31 OpenSBI XIP must be linked at 0x40030000")
-	ASSERT(FW_RW_START >= 0x50F00000 && FW_RW_START < 0x51000000,
-	       "ESP32-S31 OpenSBI RW must use the reserved cached PSRAM region")
+	ASSERT(FW_RW_START == 0x2F052000,
+	       "ESP32-S31 OpenSBI RW must use its 64-KiB HP-SRAM carve-out")
 
 	. = FW_TEXT_START;
 	/* Don't add any section between FW_TEXT_START and _fw_start */
@@ -63,13 +63,13 @@
 	/* End of the read-only data sections */
 
 	/*
-	 * Flash-resident data (LMA) will be copied to cached PSRAM (VMA).
+	 * Flash-resident data (LMA) will be copied to internal HP SRAM (VMA).
 	 * LMA is placed immediately after .rela.dyn so the binary
 	 * layout stays contiguous (objcopy won't insert a gap).
 	 */
 	PROVIDE(__data_flash_start = ADDR(.rela.dyn) + SIZEOF(.rela.dyn));
 
-	. = FW_RW_START;                  /* switch to cached PSRAM VMA */
+	. = FW_RW_START;                  /* switch to internal HP-SRAM VMA */
 
 	PROVIDE(_fw_rw_start = .);
 
@@ -108,3 +108,5 @@
 	. = ALIGN(0x1000); /* Need this to create proper sections */
 
 	PROVIDE(_fw_end = .);
+	ASSERT(_fw_end <= 0x2F056000,
+	       "ESP32-S31 OpenSBI sections exceed the carve-out's 16-KiB section budget")
