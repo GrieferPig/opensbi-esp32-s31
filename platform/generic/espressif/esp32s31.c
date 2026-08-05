@@ -416,9 +416,6 @@ static int esp32s31_hosted_ecall(unsigned long extid, unsigned long funcid,
 
 	switch (funcid) {
 	case S31_SBI_HOSTED_TX:
-		if (!regs->a1 || regs->a1 > sizeof(frame))
-			return SBI_ERR_INVALID_PARAM;
-
 		sbi_load_loop(frame, regs->a0, regs->a1, &trap);
 		if (trap.cause)
 			return SBI_ERR_INVALID_ADDRESS;

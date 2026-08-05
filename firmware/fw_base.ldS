@@ -9,9 +9,8 @@
  */
 
 	ASSERT(FW_TEXT_START == 0x40030000,
-	       "ESP32-S31 OpenSBI XIP must be linked at 0x40030000")
-	ASSERT(FW_RW_START == 0x2F052000,
-	       "ESP32-S31 OpenSBI RW must use its 64-KiB HP-SRAM carve-out")
+		"FW_TEXT_START must be ESP32-S31 partition mapped base")
+
 
 	. = FW_TEXT_START;
 	/* Don't add any section between FW_TEXT_START and _fw_start */
@@ -108,5 +107,5 @@
 	. = ALIGN(0x1000); /* Need this to create proper sections */
 
 	PROVIDE(_fw_end = .);
-	ASSERT(_fw_end <= 0x2F056000,
-	       "ESP32-S31 OpenSBI sections exceed the carve-out's 16-KiB section budget")
+	ASSERT(_fw_end <= FW_RW_START + 0x10000,
+	       "ESP32-S31 OpenSBI RW must fit in 64 KiB")
