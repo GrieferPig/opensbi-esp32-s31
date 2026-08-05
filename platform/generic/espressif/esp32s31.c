@@ -28,8 +28,6 @@
 #include <sbi/sbi_math.h>
 #include <sbi/sbi_system.h>
 #include <sbi/sbi_timer.h>
-#include <sbi/sbi_trap.h>
-#include <sbi/sbi_unpriv.h>
 
 extern struct sbi_platform platform;
 extern unsigned int sbi_hart_priv_version_override;
@@ -65,22 +63,12 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_FLASH_WRITE      0
 #define S31_SBI_FLASH_ERASE      1
 
-#define S31_SBI_EXT_HOSTED       0x09000001UL
-#define S31_SBI_HOSTED_TX        0
-#define S31_SBI_HOSTED_RX_ACK    1
-#define S31_SBI_HOSTED_H1_READY  2
 #define S31_SBI_EXT_COPROC       0x09000002UL
 #define S31_SBI_COPROC_SWITCH    0
 #define S31_SBI_COPROC_SAVE      1
 #define S31_SBI_COPROC_RESTORE   2
 #define S31_COPROC_STATE_SIZE    256UL
 #define S31_HOSTED_BASE          0x2f062f80UL
-#define S31_HOSTED_H0_RING       (S31_HOSTED_BASE + 64)
-#define S31_HOSTED_H1_RING       (S31_HOSTED_BASE + 256)
-#define S31_HOSTED_H1_SLOTS      (S31_HOSTED_BASE + 0x8800)
-#define S31_HOSTED_SLOT_SIZE     1920UL
-#define S31_HOSTED_DATA_SIZE     1912UL
-#define S31_HOSTED_SLOT_COUNT    16UL
 #define S31_HOSTED_DB_H0         0x2058601cUL
 
 #define S31_HOSTED_CTRL_POWER_OFF 5
@@ -91,17 +79,6 @@ typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
-
-static void s31_hosted_cache_writeback(const volatile void *address, u32 size)
-{
-	/*
-	 * 0x2f... is internal HP SRAM and is directly shared by both harts.
-	 * CACHE_SYNC only applies to external cached aliases.
-	 */
-	(void)address;
-	(void)size;
-	__asm__ __volatile__("fence rw, rw" ::: "memory");
-}
 
 /*
  * Publish a system request through the dedicated control-block mailbox.  It
@@ -403,72 +380,6 @@ static struct sbi_ecall_extension esp32s31_flash_ecall_ext = {
         .handle         = esp32s31_flash_ecall,
 };
 
-static int esp32s31_hosted_ecall(unsigned long extid, unsigned long funcid,
-				 struct sbi_trap_regs *regs,
-				 struct sbi_ecall_return *out)
-{
-	volatile u32 *ring;
-	struct sbi_trap_info trap = { 0 };
-	u8 frame[S31_HOSTED_DATA_SIZE];
-	u32 producer, consumer, index;
-	volatile u8 *slot;
-	u32 count;
-
-	switch (funcid) {
-	case S31_SBI_HOSTED_TX:
-		sbi_load_loop(frame, regs->a0, regs->a1, &trap);
-		if (trap.cause)
-			return SBI_ERR_INVALID_ADDRESS;
-
-		ring = (volatile u32 *)S31_HOSTED_H1_RING;
-		producer = ring[0];
-		consumer = ring[16];
-		if (producer - consumer >= S31_HOSTED_SLOT_COUNT)
-			return SBI_ERR_NO_SHMEM;
-
-		index = producer & (S31_HOSTED_SLOT_COUNT - 1);
-		slot = (volatile u8 *)(S31_HOSTED_H1_SLOTS +
-				      index * S31_HOSTED_SLOT_SIZE);
-		sbi_memcpy((void *)(slot + 8), frame, regs->a1);
-		*(volatile u16 *)(slot + 4) = regs->a1;
-		slot[6] = 0;
-		*(volatile u32 *)slot = producer + 1;
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
-		ring[0] = producer + 1;
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
-		s31_hosted_cache_writeback(slot, S31_HOSTED_SLOT_SIZE);
-		s31_hosted_cache_writeback(ring, 64);
-		writel(1, (void *)S31_HOSTED_DB_H0);
-		out->value = producer + 1;
-		return SBI_SUCCESS;
-
-	case S31_SBI_HOSTED_RX_ACK:
-		ring = (volatile u32 *)S31_HOSTED_H0_RING;
-		producer = ring[0];
-		consumer = ring[16];
-		count = regs->a0;
-		if (!count || count > producer - consumer)
-			return SBI_ERR_INVALID_PARAM;
-		ring[16] = consumer + count;
-		s31_hosted_cache_writeback(ring + 16, 64);
-		return SBI_SUCCESS;
-
-	case S31_SBI_HOSTED_H1_READY:
-		*(volatile u32 *)(S31_HOSTED_BASE + 12) |= 2;
-		__asm__ __volatile__("fence rw, rw" ::: "memory");
-		return SBI_SUCCESS;
-	default:
-		return SBI_ERR_NOT_SUPPORTED;
-	}
-}
-
-static struct sbi_ecall_extension esp32s31_hosted_ecall_ext = {
-	.name		= "s31host",
-	.extid_start	= S31_SBI_EXT_HOSTED,
-	.extid_end	= S31_SBI_EXT_HOSTED,
-	.handle		= esp32s31_hosted_ecall,
-};
-
 extern void s31_coproc_save(void *state);
 extern void s31_coproc_restore(const void *state);
 
@@ -580,9 +491,6 @@ static int esp32s31_final_init(bool cold_boot)
 
 		/* Register after generic platform setup, before SBI dispatch starts. */
 		ret = sbi_ecall_register_extension(&esp32s31_flash_ecall_ext);
-		if (ret)
-			return ret;
-		ret = sbi_ecall_register_extension(&esp32s31_hosted_ecall_ext);
 		if (ret)
 			return ret;
 		ret = sbi_ecall_register_extension(&esp32s31_coproc_ecall_ext);
