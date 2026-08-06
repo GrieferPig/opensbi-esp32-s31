@@ -68,7 +68,7 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_COPROC_SAVE      1
 #define S31_SBI_COPROC_RESTORE   2
 #define S31_COPROC_STATE_SIZE    256UL
-#define S31_HOSTED_BASE          0x2f062f80UL
+#define S31_HOSTED_BASE          0x2f06af80UL
 #define S31_HOSTED_DB_H0         0x2058601cUL
 
 #define S31_HOSTED_CTRL_POWER_OFF 5
