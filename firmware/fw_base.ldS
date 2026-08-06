@@ -8,7 +8,7 @@
  *   Anup Patel <anup.patel@wdc.com>
  */
 
-	ASSERT(FW_TEXT_START == 0x40030000,
+	ASSERT(FW_TEXT_START == 0x40220000,
 		"FW_TEXT_START must be ESP32-S31 partition mapped base")
 
 
