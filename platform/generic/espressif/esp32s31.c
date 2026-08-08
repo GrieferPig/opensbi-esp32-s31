@@ -7,15 +7,12 @@
  * M-mode OpenSBI leaves external CLIC IRQs disabled; timer is handled by
  * the generic DTS ACLINT/CLINT driver.
  *
- * This module:
- *   1. Provides a minimal UART console
- *   2. Overrides fw_platform_init to install ESP32-S31 platform hooks
- *   3. Overrides misa detection to match real hardware extensions
+ * This module overrides fw_platform_init to install ESP32-S31 platform hooks
+ * and overrides misa detection to match real hardware extensions.
  */
 
 #include <platform_override.h>
 #include <sbi/riscv_io.h>
-#include <sbi/sbi_console.h>
 #include <sbi/sbi_ecall.h>
 #include <sbi/sbi_ecall_interface.h>
 #include <sbi/sbi_platform.h>
@@ -31,13 +28,6 @@
 
 extern struct sbi_platform platform;
 extern unsigned int sbi_hart_priv_version_override;
-
-/* Linux earlycon UART0 (0x2038a000, already configured by the IDF loader). */
-#define UART_BASE         0x2038A000UL
-#define UART_FIFO         (UART_BASE + 0x00)
-#define UART_STATUS       (UART_BASE + 0x1c)
-#define UART_TXFIFO_CNT   0x00FF0000UL
-#define UART_TXFIFO_SIZE  127UL
 
 /* Core-local timer window observed on ESP32-S31. */
 #define S31_CLINT_BASE          0x10000000UL
@@ -94,9 +84,6 @@ static void s31_hosted_system_request(u8 type)
 
 static void __noreturn esp32s31_reboot(void)
 {
-	while (readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT)
-		;
-
 	/*
 	 * Hart0 owns the IDF runtime and performs the complete S31 restart
 	 * sequence, including UART/cache flush, clock switching and both cores.
@@ -109,9 +96,6 @@ static void __noreturn esp32s31_reboot(void)
 
 static void __noreturn esp32s31_poweroff(void)
 {
-	while (readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT)
-		;
-
 	/*
 	 * PMU setup is owned by the IDF runtime on hart0.  Ask it to enter deep
 	 * sleep with no wake source instead of duplicating undocumented analog
@@ -161,18 +145,6 @@ static struct sbi_system_reset_device esp32s31_reset = {
 #define S31_CLIC_ATTR_M_EDGE    0xc2
 #define S31_CLIC_SINGLE_LEVEL   0x3f
 #define S31_CSR_MINTTHRESH      0x347
-static void raw_putc(char ch)
-{
-        while ((readl_relaxed((void *)UART_STATUS) & UART_TXFIFO_CNT) >=
-               (UART_TXFIFO_SIZE << 16))
-                ;
-        writel_relaxed(ch, (void *)UART_FIFO);
-}
-
-static struct sbi_console_device esp32s31_console = {
-        .name         = "esp32s31_uart",
-        .console_putc = raw_putc,
-};
 
 static u64 esp32s31_timer_value(void)
 {
@@ -249,9 +221,6 @@ static int esp32s31_early_init(bool cold_boot)
 {
         if (!cold_boot)
                 return 0;
-        /* Reuse the exact UART that Linux takes over as its early console. */
-        sbi_console_set_device(&esp32s31_console);
-
         // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
         /* On S31 only the standard S-mode interrupt CSRs need emulation.
