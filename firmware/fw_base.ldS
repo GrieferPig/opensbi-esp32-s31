@@ -10,6 +10,8 @@
 
 	ASSERT(FW_TEXT_START == 0x40220000,
 		"FW_TEXT_START must be ESP32-S31 partition mapped base")
+	ASSERT(FW_RW_START == 0x50FF0000,
+		"FW_RW_START must be the final ESP32-S31 PSRAM MMU page")
 
 
 	. = FW_TEXT_START;
@@ -62,13 +64,13 @@
 	/* End of the read-only data sections */
 
 	/*
-	 * Flash-resident data (LMA) will be copied to internal HP SRAM (VMA).
+	 * Flash-resident data (LMA) will be copied to reserved PSRAM (VMA).
 	 * LMA is placed immediately after .rela.dyn so the binary
 	 * layout stays contiguous (objcopy won't insert a gap).
 	 */
 	PROVIDE(__data_flash_start = ADDR(.rela.dyn) + SIZEOF(.rela.dyn));
 
-	. = FW_RW_START;                  /* switch to internal HP-SRAM VMA */
+	. = FW_RW_START;                  /* switch to reserved PSRAM VMA */
 
 	PROVIDE(_fw_rw_start = .);
 
