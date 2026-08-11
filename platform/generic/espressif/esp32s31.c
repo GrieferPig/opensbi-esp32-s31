@@ -145,6 +145,7 @@ static struct sbi_system_reset_device esp32s31_reset = {
 #define S31_CLIC_ATTR_M_EDGE    0xc2
 #define S31_CLIC_SINGLE_LEVEL   0x3f
 #define S31_CSR_MINTTHRESH      0x347
+#define S31_CSR_MEXSTATUS       0x7f2
 
 static u64 esp32s31_timer_value(void)
 {
@@ -219,6 +220,9 @@ static int esp32s31_misa_xlen(void)
 /* --- Platform init --- */
 static int esp32s31_early_init(bool cold_boot)
 {
+	/* ESP-IDF radio blobs use the S31 PIE extension in S-mode. */
+	csr_write(S31_CSR_MEXSTATUS, 1);
+
         if (!cold_boot)
                 return 0;
         // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
