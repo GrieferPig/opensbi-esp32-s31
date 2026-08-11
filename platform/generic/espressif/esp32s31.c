@@ -58,52 +58,24 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_COPROC_SAVE      1
 #define S31_SBI_COPROC_RESTORE   2
 #define S31_COPROC_STATE_SIZE    256UL
-#define S31_HOSTED_BASE          0x2f06af80UL
-#define S31_HOSTED_DB_H0         0x2058601cUL
-
-#define S31_HOSTED_CTRL_POWER_OFF 5
-#define S31_HOSTED_CTRL_RESTART   6
-#define S31_HOSTED_SYSTEM_REQUEST (S31_HOSTED_BASE + 56)
+#define S31_ROM_SOFTWARE_RESET_SYSTEM 0x2f800094UL
 
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
-
-/*
- * Publish a system request through the dedicated control-block mailbox.  It
- * must not share the payload ring: Linux may leave that ring full or quiesced
- * after shutting down the Hosted network device.
- */
-static void s31_hosted_system_request(u8 type)
-{
-	writel_relaxed(type, (void *)S31_HOSTED_SYSTEM_REQUEST);
-	__asm__ __volatile__("fence rw, rw" ::: "memory");
-	writel_relaxed(1, (void *)S31_HOSTED_DB_H0);
-}
+typedef void (*s31_rom_software_reset_system_t)(void);
 
 static void __noreturn esp32s31_reboot(void)
 {
-	/*
-	 * Hart0 owns the IDF runtime and performs the complete S31 restart
-	 * sequence, including UART/cache flush, clock switching and both cores.
-	 */
-	s31_hosted_system_request(S31_HOSTED_CTRL_RESTART);
+	s31_rom_software_reset_system_t reset_system =
+		(s31_rom_software_reset_system_t)S31_ROM_SOFTWARE_RESET_SYSTEM;
 
-	for (;;)
-		__asm__ __volatile__("wfi");
-}
-
-static void __noreturn esp32s31_poweroff(void)
-{
-	/*
-	 * PMU setup is owned by the IDF runtime on hart0.  Ask it to enter deep
-	 * sleep with no wake source instead of duplicating undocumented analog
-	 * and power-domain programming in OpenSBI.
-	 */
-	s31_hosted_system_request(S31_HOSTED_CTRL_POWER_OFF);
-
-	/* The successful IDF deep-sleep path powers this hart down. */
+	/* This mask-ROM entry is the esp_rom_software_reset_system() backend
+	 * exported by ESP-IDF for ESP32-S31.  It does not depend on hart0,
+	 * FreeRTOS, or the retired ESP-Hosted SRAM mailbox. */
+	__asm__ __volatile__("fence rw, rw" ::: "memory");
+	reset_system();
 	for (;;)
 		__asm__ __volatile__("wfi");
 }
@@ -113,7 +85,6 @@ static int esp32s31_system_reset_check(u32 type, u32 reason)
 	(void)reason;
 
 	switch (type) {
-	case SBI_SRST_RESET_TYPE_SHUTDOWN:
 	case SBI_SRST_RESET_TYPE_COLD_REBOOT:
 	case SBI_SRST_RESET_TYPE_WARM_REBOOT:
 		return 1;
@@ -126,8 +97,6 @@ static void esp32s31_system_reset(u32 type, u32 reason)
 {
 	(void)reason;
 
-	if (type == SBI_SRST_RESET_TYPE_SHUTDOWN)
-		esp32s31_poweroff();
 	esp32s31_reboot();
 }
 
