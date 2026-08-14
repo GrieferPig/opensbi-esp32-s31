@@ -46,9 +46,6 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_PSRAM_LINUX_START    0x50000000UL
 /* Exclusive end of the complete 16-MiB Linux PSRAM memory node. */
 #define S31_PSRAM_LINUX_END      0x51000000UL
-/* Not owned by Linux or the bootloader app after the firmware handoff. */
-#define S31_DRAM_FLASH_BUFFER    0x2f07ff00UL
-
 #define S31_SBI_EXT_FLASH        0x09000000UL
 #define S31_SBI_FLASH_WRITE      0
 #define S31_SBI_FLASH_ERASE      1
@@ -65,6 +62,15 @@ typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
 typedef void (*s31_rom_software_reset_system_t)(void);
+
+/*
+ * ROM Wi-Fi/PP globals occupy 0x2f07fc3c..0x2f07ffa8, including xphyQueue,
+ * pp_task_hdl, s_wifi_queue, and the registered netstack callbacks.  A former
+ * fixed staging address at 0x2f07ff00 overwrote those globals on every MTD
+ * write.  Keep the ROM flash input in OpenSBI's own internal HP-SRAM .bss;
+ * the SBI flash extension is serialized by Linux and runs on the sole hart.
+ */
+static u32 s31_flash_buffer[8];
 
 static void __noreturn esp32s31_reboot(void)
 {
@@ -296,10 +302,9 @@ static int esp32s31_flash_ecall(unsigned long extid, unsigned long funcid,
 		    regs->a1 >= S31_PSRAM_LINUX_END ||
 		    length > S31_PSRAM_LINUX_END - regs->a1)
 			return SBI_ERR_INVALID_PARAM;
-                sbi_memcpy((void *)S31_DRAM_FLASH_BUFFER,
-                           (const void *)regs->a1, length);
+                sbi_memcpy(s31_flash_buffer, (const void *)regs->a1, length);
                 ret = ((s31_rom_flash_write_t)S31_ROM_FLASH_WRITE)(
-                        address, (const u32 *)S31_DRAM_FLASH_BUFFER, length);
+                        address, s31_flash_buffer, length);
                 break;
         case S31_SBI_FLASH_ERASE:
                 if ((address | length) & 0xfff)
