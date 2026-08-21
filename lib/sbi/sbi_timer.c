@@ -31,6 +31,7 @@ static unsigned long timer_state_off;
 static u64 (*get_time_val)(void);
 static const struct sbi_timer_device *timer_dev = NULL;
 
+
 #if __riscv_xlen == 32
 static u64 get_ticks(void)
 {
@@ -257,11 +258,7 @@ static void sbi_timer_smode_event_callback(struct sbi_timer_event *ev,
 	 */
 	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
 #ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-		/*
-		 * The S31 timer device routes the physical compare interrupt
-		 * directly to S-mode CLIC ID7, so no software STIP injection is
-		 * needed.
-		 */
+		/* Physical compare is delivered directly to S-mode CLIC ID7. */
 #else
 		csr_set(CSR_MIP, MIP_STIP);
 #endif
@@ -272,7 +269,7 @@ static void sbi_timer_smode_event_cleanup(struct sbi_timer_event *ev)
 {
 	if (!sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
 #ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-		/* S31 has no synthetic supervisor-timer pending state. */
+		/* ID7 is owned and cleared by the S-mode timer handler. */
 #else
 		csr_clear(CSR_MIP, MIP_STIP);
 #endif
@@ -293,9 +290,9 @@ void sbi_timer_smode_event_start(u64 next_event)
 	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SSTC)) {
 		csr_write64(CSR_STIMECMP, next_event);
 	} else {
-#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 		csr_clear(CSR_MIP, MIP_STIP);
-#endif
+	#endif
 		sbi_timer_event_start(&tstate->smode_ev, next_event);
 	}
 }

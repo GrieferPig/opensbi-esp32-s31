@@ -504,3 +504,8 @@ void sbi_console_set_device(const struct sbi_console_device *dev)
 			sbi_putc(ch);
 	}
 }
+
+void sbi_console_release_device(void)
+{
+	console_dev = NULL;
+}

@@ -58,10 +58,10 @@
 	.globl _start
 	.globl _start_warm
 _start:
-	/* ESP32-S31: the ESP-IDF factory app owns hart 0; OpenSBI owns hart 1. */
+	/* ESP32-S31 SMP: accept both hart 0 and hart 1. */
 	csrr	a0, CSR_MHARTID
 	li	t0, 1
-	bne	a0, t0, _start_hang
+	bltu	t0, a0, _start_hang
 
 	/*
 	 * Flash XIP: copy .data from Flash (LMA) to cached PSRAM (VMA) *before*
@@ -404,6 +404,18 @@ _start_warm:
 
 	/* update the mscratch */
 	csrw	CSR_MSCRATCH, tp
+
+	/* Re-assert the next boot stage in this scratch.  The boot hart
+	 * initializes all scratch slots, but ESP32-S31 warm startup has
+	 * observed corrupted next_addr/next_arg1 in the secondary scratch
+	 * after the cold-boot state crosses the shared D-cache. */
+#ifdef FW_JUMP_ADDR
+	li	a4, FW_JUMP_ADDR
+	REG_S	a4, SBI_SCRATCH_NEXT_ADDR_OFFSET(tp)
+	li	a4, PRV_S
+	REG_S	a4, SBI_SCRATCH_NEXT_MODE_OFFSET(tp)
+	REG_S	a1, SBI_SCRATCH_NEXT_ARG1_OFFSET(tp)
+#endif
 
 	/* Setup stack */
 	add	sp, tp, zero

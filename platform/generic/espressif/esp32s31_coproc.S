@@ -49,7 +49,14 @@ s31_coproc_save:
 	csrr	t0, CSR_LOOP1_COUNT
 	sw	t0, 20(a0)
 
+	/* PIE is only implemented on hart 1.  Hart 0 would take an illegal-
+	 * instruction trap on the first PIE access, so skip PIE save there and
+	 * keep HWLoop state only. */
+	csrr	t1, CSR_MHARTID
+	beqz	t1, 3f
 	/* Match IDF's pie_enable: enable before every register access. */
+	csrr	t1, CSR_MHARTID
+	beqz	t1, 3f
 	csrwi	CSR_PIE_STATE, COPROC_INITIAL_STATE
 	addi	a0, a0, S31_PIE_OFFSET
 	/* q0..q7, 16 bytes each, post-increment by 16. */
@@ -77,6 +84,7 @@ s31_coproc_save:
 	sb	a2, 5(a0)
 	.word	0x80c0219b	/* esp.movx.r.sar a1 */
 	sb	a1, 6(a0)
+3:
 	ret
 	.size s31_coproc_save, .-s31_coproc_save
 
@@ -107,6 +115,9 @@ s31_coproc_restore:
 	csrwi	CSR_HWLP_STATE, COPROC_DIRTY_STATE
 2:
 
+	/* PIE is only implemented on hart 1; skip PIE restore on hart 0. */
+	csrr	t1, CSR_MHARTID
+	beqz	t1, 3f
 	csrwi	CSR_PIE_STATE, COPROC_INITIAL_STATE
 	addi	a0, a0, S31_PIE_OFFSET
 	.word	0x0311009f
@@ -129,5 +140,6 @@ s31_coproc_restore:
 	.word	0x98c1a01b	/* esp.movx.w.sar.bytes a1 */
 	lbu	a1, 6(a0)
 	.word	0x90c1a01b	/* esp.movx.w.sar a1 */
+3:
 	ret
 	.size s31_coproc_restore, .-s31_coproc_restore

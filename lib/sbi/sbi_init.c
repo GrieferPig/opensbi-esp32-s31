@@ -218,6 +218,10 @@ static void wake_coldboot_harts(struct sbi_scratch *scratch)
 	__smp_store_release(&coldboot_done, 1);
 }
 
+void __attribute__((weak)) sbi_platform_warmboot_sync(void)
+{
+}
+
 unsigned long __attribute__((weak)) __stack_chk_guard = 0x95B5FF5A;
 
 static unsigned long entry_count_offset;
@@ -265,6 +269,7 @@ static void __noreturn init_coldboot(struct sbi_scratch *scratch, u32 hartid)
 	 * have these HARTs busy spin in wait_for_coldboot() until coldboot
 	 * path is completed.
 	 */
+	sbi_platform_warmboot_sync();
 	wake_coldboot_harts(scratch);
 
 	rc = sbi_hart_init(scratch, true);

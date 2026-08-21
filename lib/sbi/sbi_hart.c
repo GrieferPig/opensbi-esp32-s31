@@ -25,6 +25,7 @@
 
 extern void __sbi_expected_trap(void);
 extern void __sbi_expected_trap_hext(void);
+void __attribute__((weak)) sbi_platform_console_release(void) { }
 
 void (*sbi_hart_expected_trap)(void) = &__sbi_expected_trap;
 
@@ -838,6 +839,8 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 #else
 	unsigned long val;
 #endif
+	unsigned long arg0_saved = arg0;
+	unsigned long arg1_saved = arg1;
 
 	switch (next_mode) {
 	case PRV_M:
@@ -856,6 +859,10 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 
 	val = csr_read(CSR_MSTATUS);
 	val = INSERT_FIELD(val, MSTATUS_MPP, next_mode);
+	/* Runtime IPI and clockevent delivery are native S-mode CLIC paths on
+	 * ESP32-S31.  Keep M interrupts disabled across the initial mret so an
+	 * M-mode CLIC input cannot create the cross-privilege SIL=0xff state.
+	 */
 	val = INSERT_FIELD(val, MSTATUS_MPIE, 0);
 #if __riscv_xlen == 32
 	/*
@@ -873,6 +880,9 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 #endif
 	csr_write(CSR_MSTATUS, val);
 	csr_write(CSR_MEPC, next_addr);
+	sbi_printf("S31 switch: hart%u satp=%lx sintstatus=%lx next_addr=%lx next_mode=%lu\n",
+		   current_hartid(), csr_read(CSR_SATP), csr_read(0xdb1),
+		   next_addr, next_mode);
 
 	if (next_mode == PRV_S) {
 		if (next_virt) {
@@ -885,6 +895,11 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 			sbi_scsr_write(CSR_SSCRATCH, 0);
 			sbi_scsr_write(CSR_SIE, 0);
 			sbi_scsr_write(CSR_SATP, 0);
+			/* ESP32-S31: the S-mode CSR shadow does not reliably clear
+			 * satp on warm harts; write the real CSR as well so the
+			 * secondary hart starts Linux with MMU off.
+			 */
+			csr_write(CSR_SATP, 0);
 		}
 	} else if (next_mode == PRV_U) {
 		if (misa_extension('N')) {
@@ -894,8 +909,14 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 		}
 	}
 
-	register unsigned long a0_reg asm("a0") = arg0;
-	register unsigned long a1_reg asm("a1") = arg1;
+	/* Release the platform console/UART before the next mode runs.
+	 * On ESP32-S31 OpenSBI owns the polling UART; Linux earlycon/console
+	 * needs it handed off cleanly.
+	 */
+	sbi_platform_console_release();
+
+	register unsigned long a0_reg asm("a0") = arg0_saved;
+	register unsigned long a1_reg asm("a1") = arg1_saved;
 	__asm__ __volatile__(
 		"csrw mepc, %0\n\t"
 		"csrw mstatus, %1\n\t"
