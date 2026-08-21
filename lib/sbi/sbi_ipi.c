@@ -384,16 +384,21 @@ int sbi_ipi_init(struct sbi_scratch *scratch, bool cold_boot)
 	/* Clear any pending IPIs for the current hart */
 	sbi_ipi_raw_clear(true);
 
-	/* Enable software interrupts */
+	/* S31 HSM startup is polling-based and Linux supplies native S-mode
+	 * doorbell IPIs.  Do not arm the machine software interrupt path. */
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 	csr_set(CSR_MIE, MIP_MSIP);
+#endif
 
 	return 0;
 }
 
 void sbi_ipi_exit(struct sbi_scratch *scratch)
 {
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 	/* Disable software interrupts */
 	csr_clear(CSR_MIE, MIP_MSIP);
+#endif
 
 	/* Process pending IPIs */
 	sbi_ipi_process();

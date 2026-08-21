@@ -55,6 +55,7 @@ void __printf(1, 2) __attribute__((noreturn)) sbi_panic(const char *format, ...)
 const struct sbi_console_device *sbi_console_get_device(void);
 
 void sbi_console_set_device(const struct sbi_console_device *dev);
+void sbi_console_release_device(void);
 
 struct sbi_scratch;
 

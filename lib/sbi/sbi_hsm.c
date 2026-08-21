@@ -152,6 +152,9 @@ void __noreturn sbi_hsm_hart_start_finish(struct sbi_scratch *scratch,
 	next_arg1 = scratch->next_arg1;
 	next_addr = scratch->next_addr;
 	next_mode = scratch->next_mode;
+	if (hartid == 0)
+		sbi_printf("S31 HSM: finish hart%u scratch=%p next_addr=%lx arg1=%lx mode=%lx\n",
+			   hartid, scratch, next_addr, next_arg1, next_mode);
 	hsm_start_ticket_release(hdata);
 
 	sbi_hart_switch_mode(hartid, next_arg1, next_addr, next_mode, false);
@@ -159,14 +162,18 @@ void __noreturn sbi_hsm_hart_start_finish(struct sbi_scratch *scratch,
 
 static void sbi_hsm_hart_wait(struct sbi_scratch *scratch)
 {
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 	unsigned long saved_mie;
+#endif
 	struct sbi_hsm_data *hdata = sbi_scratch_offset_ptr(scratch,
 							    hart_data_offset);
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 	/* Save MIE CSR */
 	saved_mie = csr_read(CSR_MIE);
 
 	/* Set MSIE and MEIE bits to receive IPI */
 	csr_set(CSR_MIE, MIP_MSIP | MIP_MEIP);
+#endif
 
 	/* Wait for state transition requested by sbi_hsm_hart_start() */
 	while (atomic_read(&hdata->state) != SBI_HSM_STATE_START_PENDING) {
@@ -179,11 +186,28 @@ static void sbi_hsm_hart_wait(struct sbi_scratch *scratch)
 			hsm_device_hart_stop();
 		}
 
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		/*
+		 * S31 never unmasks M-mode CLIC ID3.  Poll the HSM state instead;
+		 * the boot hart writes the state and then flushes PSRAM in
+		 * sbi_platform_hsm_start_sync(), so the
+		 * poll loop sees START_PENDING almost immediately.
+		 */
+		{
+			unsigned long wait = 100000;
+
+			while (wait--)
+				__asm__ __volatile__("");
+		}
+#else
 		wfi();
+#endif
 	}
 
+#ifndef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 	/* Restore MIE CSR */
 	csr_write(CSR_MIE, saved_mie);
+#endif
 
 	/*
 	 * No need to clear IPI here because the sbi_ipi_init() will
@@ -304,6 +328,10 @@ fail_exit:
 	sbi_hart_hang();
 }
 
+void __attribute__((weak)) sbi_platform_hsm_start_sync(u32 hartid)
+{
+}
+
 int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 		       const struct sbi_domain *dom,
 		       u32 hartid, ulong saddr, ulong smode, ulong arg1)
@@ -339,6 +367,9 @@ int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 	rscratch->next_addr = saddr;
 	rscratch->next_mode = smode;
 
+	sbi_printf("S31 HSM: start hart%u rscratch=%p saddr=%lx arg1=%lx smode=%lx\n",
+		   hartid, rscratch, saddr, arg1, smode);
+
 	/*
 	 * atomic_cmpxchg() is an implicit barrier. It makes sure that
 	 * other harts see reading of init_count and writing to *rscratch
@@ -360,11 +391,24 @@ int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 		goto err;
 	}
 
+	/* Platform hook: flush cached scratch state to PSRAM *after* the
+	 * state transition so the target hart observes both the new next
+	 * context and hdata->state == START_PENDING before the IPI.
+	 */
+	sbi_platform_hsm_start_sync(hartid);
+
 	if ((hsm_device_has_hart_hotplug() && (entry_count == init_count)) ||
 	   (hsm_device_has_hart_secondary_boot() && !init_count)) {
 		rc = hsm_device_hart_start(hartid, scratch->warmboot_addr);
 	} else {
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+		/* The target is already polling hdata->state in M-mode.  The
+		 * platform sync above publishes START_PENDING to shared PSRAM;
+		 * no physical M-mode IPI is needed. */
+		rc = 0;
+#else
 		rc = sbi_ipi_raw_send(hartindex, true);
+#endif
 	}
 
 	if (!rc)

@@ -27,6 +27,11 @@
 #include <sbi/sbi_timer.h>
 #include <sbi/sbi_trap.h>
 
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+void esp32s31_record_m_interrupt(ulong raw_mcause,
+				 const struct sbi_trap_regs *regs);
+#endif
+
 static void sbi_trap_error_one(const struct sbi_trap_context *tcntx,
 			       const char *prefix, u32 hartid, u32 depth)
 {
@@ -335,6 +340,10 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 	/* Update trap context pointer */
 	tcntx->prev_context = sbi_trap_get_context(scratch);
 	sbi_trap_set_context(scratch, tcntx);
+
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	esp32s31_record_m_interrupt(raw_mcause, regs);
+#endif
 
 	if (raw_mcause & MCAUSE_IRQ_MASK) {
 		if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),

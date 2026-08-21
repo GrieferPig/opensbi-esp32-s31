@@ -19,7 +19,7 @@
 	 * The boot HART id should be returned in 'a0'.
 	 */
 fw_boot_hart:
-	li	a0, 1     /* ESP32-S31: ESP-IDF keeps hart 0; Linux boots on hart 1 */
+	li	a0, 0     /* ESP32-S31 SMP: Linux boots on hart 0 */
 	ret
 
 	.section .entry, "ax", %progbits

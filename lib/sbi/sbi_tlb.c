@@ -457,8 +457,21 @@ int sbi_tlb_init(struct sbi_scratch *scratch, bool cold_boot)
 	tlb_q = sbi_scratch_offset_ptr(scratch, tlb_fifo_off);
 	tlb_mem = sbi_scratch_read_type(scratch, void *, tlb_fifo_mem_off);
 	if (!tlb_mem) {
-		tlb_mem = sbi_malloc(
-				sbi_platform_tlb_fifo_num_entries(plat) * SBI_TLB_INFO_SIZE);
+		/* ESP32-S31: the global heap is cold-boot state in cached PSRAM.
+		 * Secondary harts have observed stale/corrupt free lists when they
+		 * allocate from it during warm startup.  The TLB FIFO is tiny and
+		 * per-hart, so give warm harts a static fallback instead of taking
+		 * the first (and only) SBI heap path on the secondary hart.
+		 */
+		static char tlb_mem_fallback[2][SBI_TLB_INFO_SIZE * 2]
+			__attribute__((aligned(64)));
+
+		if (!cold_boot) {
+			tlb_mem = tlb_mem_fallback[current_hartid()];
+		} else {
+			tlb_mem = sbi_malloc(
+					sbi_platform_tlb_fifo_num_entries(plat) * SBI_TLB_INFO_SIZE);
+		}
 		if (!tlb_mem)
 			return SBI_ENOMEM;
 		sbi_scratch_write_type(scratch, void *, tlb_fifo_mem_off, tlb_mem);

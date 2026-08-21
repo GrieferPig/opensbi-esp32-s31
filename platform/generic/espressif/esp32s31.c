@@ -25,6 +25,8 @@
 #include <sbi/sbi_math.h>
 #include <sbi/sbi_system.h>
 #include <sbi/sbi_timer.h>
+#include <sbi/sbi_console.h>
+#include <sbi/sbi_trap.h>
 
 extern struct sbi_platform platform;
 extern unsigned int sbi_hart_priv_version_override;
@@ -46,9 +48,6 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_PSRAM_LINUX_START    0x50000000UL
 /* Exclusive end of the complete 16-MiB Linux PSRAM memory node. */
 #define S31_PSRAM_LINUX_END      0x51000000UL
-/* Not owned by Linux or the bootloader app after the firmware handoff. */
-#define S31_DRAM_FLASH_BUFFER    0x2f07ff00UL
-
 #define S31_SBI_EXT_FLASH        0x09000000UL
 #define S31_SBI_FLASH_WRITE      0
 #define S31_SBI_FLASH_ERASE      1
@@ -58,52 +57,33 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_SBI_COPROC_SAVE      1
 #define S31_SBI_COPROC_RESTORE   2
 #define S31_COPROC_STATE_SIZE    256UL
-#define S31_HOSTED_BASE          0x2f06af80UL
-#define S31_HOSTED_DB_H0         0x2058601cUL
-
-#define S31_HOSTED_CTRL_POWER_OFF 5
-#define S31_HOSTED_CTRL_RESTART   6
-#define S31_HOSTED_SYSTEM_REQUEST (S31_HOSTED_BASE + 56)
+#define S31_ROM_SOFTWARE_RESET_SYSTEM 0x2f800094UL
 
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
                                      s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
+typedef void (*s31_rom_software_reset_system_t)(void);
 
 /*
- * Publish a system request through the dedicated control-block mailbox.  It
- * must not share the payload ring: Linux may leave that ring full or quiesced
- * after shutting down the Hosted network device.
+ * ROM Wi-Fi/PP globals occupy 0x2f07fc3c..0x2f07ffa8, including xphyQueue,
+ * pp_task_hdl, s_wifi_queue, and the registered netstack callbacks.  A former
+ * fixed staging address at 0x2f07ff00 overwrote those globals on every MTD
+ * write.  Keep the ROM flash input in OpenSBI's own internal HP-SRAM .bss;
+ * the SBI flash extension is serialized by Linux and runs on the sole hart.
  */
-static void s31_hosted_system_request(u8 type)
-{
-	writel_relaxed(type, (void *)S31_HOSTED_SYSTEM_REQUEST);
-	__asm__ __volatile__("fence rw, rw" ::: "memory");
-	writel_relaxed(1, (void *)S31_HOSTED_DB_H0);
-}
+static u32 s31_flash_buffer[8];
 
 static void __noreturn esp32s31_reboot(void)
 {
-	/*
-	 * Hart0 owns the IDF runtime and performs the complete S31 restart
-	 * sequence, including UART/cache flush, clock switching and both cores.
-	 */
-	s31_hosted_system_request(S31_HOSTED_CTRL_RESTART);
+	s31_rom_software_reset_system_t reset_system =
+		(s31_rom_software_reset_system_t)S31_ROM_SOFTWARE_RESET_SYSTEM;
 
-	for (;;)
-		__asm__ __volatile__("wfi");
-}
-
-static void __noreturn esp32s31_poweroff(void)
-{
-	/*
-	 * PMU setup is owned by the IDF runtime on hart0.  Ask it to enter deep
-	 * sleep with no wake source instead of duplicating undocumented analog
-	 * and power-domain programming in OpenSBI.
-	 */
-	s31_hosted_system_request(S31_HOSTED_CTRL_POWER_OFF);
-
-	/* The successful IDF deep-sleep path powers this hart down. */
+	/* This mask-ROM entry is the esp_rom_software_reset_system() backend
+	 * exported by ESP-IDF for ESP32-S31.  It does not depend on hart0,
+	 * FreeRTOS, or the retired ESP-Hosted SRAM mailbox. */
+	__asm__ __volatile__("fence rw, rw" ::: "memory");
+	reset_system();
 	for (;;)
 		__asm__ __volatile__("wfi");
 }
@@ -113,7 +93,6 @@ static int esp32s31_system_reset_check(u32 type, u32 reason)
 	(void)reason;
 
 	switch (type) {
-	case SBI_SRST_RESET_TYPE_SHUTDOWN:
 	case SBI_SRST_RESET_TYPE_COLD_REBOOT:
 	case SBI_SRST_RESET_TYPE_WARM_REBOOT:
 		return 1;
@@ -126,8 +105,6 @@ static void esp32s31_system_reset(u32 type, u32 reason)
 {
 	(void)reason;
 
-	if (type == SBI_SRST_RESET_TYPE_SHUTDOWN)
-		esp32s31_poweroff();
 	esp32s31_reboot();
 }
 
@@ -136,15 +113,106 @@ static struct sbi_system_reset_device esp32s31_reset = {
 	.system_reset_check = esp32s31_system_reset_check,
 	.system_reset = esp32s31_system_reset,
 };
+/* Simple polling console on the loader-configured UART0.  The DT stdout
+ * path uses the UHCI UART which OpenSBI has no driver for, but the plain
+ * UART FIFO at 0x2038a000 is already pinned and clocked by the bootloader.
+ */
+#define S31_UART_BASE            0x2038a000UL
+#define S31_UART_STATUS_REG      (S31_UART_BASE + 0x1c)
+#define S31_UART_TXFIFO_CNT      GENMASK(23, 16)
+
+static void esp32s31_console_putc(char ch)
+{
+	while ((readl((void *)S31_UART_STATUS_REG) & S31_UART_TXFIFO_CNT) >= 127)
+		;
+	writel((u32)(u8)ch, (void *)S31_UART_BASE);
+}
+
+static struct sbi_console_device esp32s31_console = {
+.name = "esp32s31-uart0",
+.console_putc = esp32s31_console_putc,
+};
+
+/* Drain the OpenSBI UART0 FIFO and drop the console device before
+ * handing off to Linux.  Linux uses the same UART for earlycon/console;
+ * leaving the OpenSBI console installed after mret lets later SBI prints
+ * race with Linux UART output and has been observed to break the Linux
+ * console entirely.
+ */
+void sbi_platform_console_release(void)
+{
+	u32 i;
+
+	for (i = 0; i < 1000000; i++) {
+		if (!(readl((void *)S31_UART_STATUS_REG) & S31_UART_TXFIFO_CNT))
+			break;
+	}
+
+	sbi_console_release_device();
+}
+
+/* Write back the OpenSBI 64 KiB PSRAM page so the shared secondary hart
+ * can observe cold-boot heap/scratch state even if its PMA load path does
+ * not hit the shared D-cache.  Matches the bootloader/head.S sequence.
+ */
+#define S31_CACHE_BASE            0x2c000000UL
+#define S31_CACHE_MAP_DCACHE      0x10
+#define S31_CACHE_WRITEBACK_ENA   0x4
+
+void sbi_platform_warmboot_sync(void)
+{
+	volatile void *cache = (volatile void *)S31_CACHE_BASE;
+
+	writel(S31_CACHE_MAP_DCACHE, cache + 0xa0);
+	writel(0x50000000, cache + 0xa4);
+	writel(0x01000000, cache + 0xa8);
+	RISCV_FENCE(ow, ow);
+	writel(S31_CACHE_WRITEBACK_ENA, cache + 0x9c);
+	while (readl(cache + 0x9c) & 0x10)
+		;
+	writel(S31_CACHE_WRITEBACK_ENA, cache + 0x9c);
+	while (readl(cache + 0x9c) & 0x10)
+		;
+	RISCV_FENCE(iorw, iorw);
+}
+
+void sbi_platform_hsm_start_sync(u32 hartid)
+{
+	sbi_platform_warmboot_sync();
+}
+
 #define S31_MCLICCFG            0x10800000UL
 #define S31_CLICCFG_NMBITS_MASK (3U << 5)
 #define S31_CLICCFG_NMBITS_1    (1U << 5)
 #define S31_CLIC_CTRL_BASE      0x10801000UL
 #define S31_CLIC_WORD(id)       (S31_CLIC_CTRL_BASE + (4UL * (id)))
+#define S31_CLIC_NUM_SLOTS      128
+#define S31_INTMATRIX_BASE      0x20585000UL
+#define S31_INTMATRIX_STRIDE    0x800UL
+/* IDF interrupt_core[01]_reg.h: the last source mapping is at 0x2a0. */
+#define S31_INTMATRIX_LAST_MAP  0x2a0UL
 #define S31_CLIC_ATTR_S_EDGE    0x42
 #define S31_CLIC_ATTR_M_EDGE    0xc2
 #define S31_CLIC_SINGLE_LEVEL   0x3f
 #define S31_CSR_MINTTHRESH      0x347
+#define S31_CSR_MEXSTATUS       0x7f2
+#define S31_CSR_PMACFG0         0xbc0
+#define S31_CSR_PMAADDR0        0xbd0
+#define S31_CSR_PMACFG7         0xbc7
+#define S31_CSR_PMAADDR7        0xbd7
+
+/* PMA state is hart-local on S31.  A software reset can leave the secondary
+ * hart without the cached-PSRAM aperture even though the loader configured it
+ * on the previous boot; the first M-mode trap then faults while fetching the
+ * XIP trap vector.  Re-assert the ESP-IDF PMA7 NAPOT entry on every hart boot. */
+static void esp32s31_pma_init(void)
+{
+        csr_write_num(S31_CSR_PMACFG7, 0);
+        csr_write_num(S31_CSR_PMAADDR7, 0);
+        csr_write_num(S31_CSR_PMAADDR7, 0x147fffff);
+        csr_write_num(S31_CSR_PMACFG7, 0xe000001d);
+        RISCV_FENCE(iorw, iorw);
+}
 
 static u64 esp32s31_timer_value(void)
 {
@@ -172,19 +240,10 @@ static void esp32s31_timer_event_start(u64 next_event)
 {
         /* Deliver the hardware compare directly to S-mode as local ID7. */
         volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
-
-        /*
-         * Re-assert the machine-side gate while servicing every timer SBI
-         * call.  S31 can restore mintthresh to 0x0f on the later privilege
-         * return, so this is only M-mode defence in depth; Linux's sanitized
-         * non-nested scause token is the persistent SIL=0xff protection.
-         */
-        csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
-
         clic_tmr[0] = 0;                       /* IP: clear edge latch */
         clic_tmr[1] = 1;                       /* IE: ensure enabled */
         clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
-        clic_tmr[3] = S31_CLIC_SINGLE_LEVEL;   /* Same level as S peripherals */
+        clic_tmr[3] = S31_CLIC_SINGLE_LEVEL;
 
         writel_relaxed(0xffffffff, (void *)S31_MTIMECMP_HI);
         writel_relaxed((u32)next_event, (void *)S31_MTIMECMP_LO);
@@ -198,6 +257,75 @@ static struct sbi_timer_device esp32s31_timer = {
         .timer_event_start = esp32s31_timer_event_start,
         .timer_event_stop = esp32s31_timer_event_stop,
 };
+
+/*
+ * Keep a persistent, per-hart record of every M-mode trap.  S31 enters
+ * OpenSBI not only for M-mode CLIC interrupts but also for undelegatable
+ * U/S ecalls.  Recording both is required to identify which privilege
+ * crossing first leaves SINTSTATUS.SIL at the 0xff sentinel.
+ * OpenOCD can locate s31_mtrap_debug in fw_jump.elf.  Halt both harts and
+ * write back the shared D-cache before reading its physical PSRAM address.
+ * Recording happens before OpenSBI dispatch, so an unhandled raw ID such as
+ * ID21 and the immediately preceding synchronous crossings are preserved
+ * even if the firmware subsequently parks in trap error.
+ */
+#define S31_MTRAP_DEBUG_MAGIC   0x4d545233U /* "MTR3" */
+#define S31_MTRAP_DEBUG_HARTS   2
+#define S31_MTRAP_DEBUG_IDS     48
+#define S31_MTRAP_DEBUG_EVENTS  16
+
+struct s31_mtrap_event {
+        u32 sequence;
+        u32 raw_mcause;
+        u32 mepc;
+        u32 mstatus;
+        u32 clic_word;
+};
+
+struct s31_mtrap_record {
+        u32 magic;
+        u32 total;
+        u32 head;
+        u32 last_id;
+        u32 counts[S31_MTRAP_DEBUG_IDS];
+        struct s31_mtrap_event events[S31_MTRAP_DEBUG_EVENTS];
+};
+
+volatile struct s31_mtrap_record
+s31_mtrap_debug[S31_MTRAP_DEBUG_HARTS];
+
+void esp32s31_record_m_interrupt(ulong raw_mcause,
+                                 const struct sbi_trap_regs *regs)
+{
+        u32 hartid = current_hartid();
+        u32 id = raw_mcause & 0xfff;
+        volatile struct s31_mtrap_record *record;
+        volatile struct s31_mtrap_event *event;
+        u32 sequence;
+
+        if (hartid >= S31_MTRAP_DEBUG_HARTS)
+                return;
+
+        record = &s31_mtrap_debug[hartid];
+        sequence = record->total + 1;
+        event = &record->events[record->head &
+                                (S31_MTRAP_DEBUG_EVENTS - 1)];
+
+        event->raw_mcause = raw_mcause;
+        event->mepc = regs->mepc;
+        event->mstatus = regs->mstatus;
+        event->clic_word = (raw_mcause & MCAUSE_IRQ_MASK) && id < 128 ?
+                readl((void *)S31_CLIC_WORD(id)) : 0;
+        event->sequence = sequence;
+
+        if (id < S31_MTRAP_DEBUG_IDS)
+                record->counts[id]++;
+        record->last_id = id;
+        record->head++;
+        record->magic = S31_MTRAP_DEBUG_MAGIC;
+        RISCV_FENCE(w, w);
+        record->total = sequence;
+}
 
 /* --- misa override: RV32IMAFBCNSUX --- */
 static int esp32s31_misa_extension(char ext)
@@ -216,11 +344,99 @@ static int esp32s31_misa_xlen(void)
         return 1;
 }
 
+static void esp32s31_clic_local_reset(void)
+{
+        ulong hartid = current_hartid();
+        ulong matrix = S31_INTMATRIX_BASE + hartid * S31_INTMATRIX_STRIDE;
+        int i;
+
+        /*
+         * The ESP-IDF loader and radio setup can leave interrupt-matrix
+         * sources routed to M-mode CLIC slots on the boot hart.  In
+         * particular ID21 has hardwired MODE=M and IE=1, so clearing its IP
+         * latch alone is insufficient: an asserted level source immediately
+         * sets it again.  Disconnect every IDF-defined source first, then
+         * clear the complete address-virtualised local CLIC bank.  Linux and
+         * the platform code explicitly rebuild only the routes they own.
+         */
+        for (i = 0; i <= S31_INTMATRIX_LAST_MAP; i += sizeof(u32))
+                writel(0, (void *)(matrix + i));
+
+        for (i = 0; i < S31_CLIC_NUM_SLOTS; i++) {
+                volatile u8 *slot = (u8 *)S31_CLIC_WORD(i);
+
+                slot[0] = 0; /* IP */
+                slot[1] = 0; /* IE */
+                slot[2] = 0; /* ATTR */
+                slot[3] = 0; /* CTL */
+        }
+        RISCV_FENCE(iorw, iorw);
+}
+
+static void esp32s31_clic_local_init(void)
+{
+        esp32s31_clic_local_reset();
+
+        /* Linux aggregates timer and IPI into one S-mode slot per hart;
+         * keep the controller in the non-nested configuration. */
+        writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
+               S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
+        csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
+        csr_write(0x147, 0); /* sintthresh */
+
+        /* Configure CLIC interrupts for timer and software IPI.
+         * CLIC ID 1 = S-mode software interrupt (Linux native IPI/fallback).
+         * CLIC ID 3 = machine software interrupt (OpenSBI cross-hart IPI).
+         * CLIC ID 7 = machine timer interrupt (via SYSTIMER COMPx routing).
+         * MODE must be written explicitly. */
+        volatile uint8_t *clic_sipi_ip   = (uint8_t *)S31_CLIC_WORD(1);
+        volatile uint8_t *clic_swi = (uint8_t *)S31_CLIC_WORD(3);
+        volatile uint8_t *clic_tmr_ip   = (uint8_t *)0x1080101C;
+        volatile uint8_t *clic_tmr_attr = (uint8_t *)0x1080101E;
+        volatile uint8_t *clic_tmr_ctl  = (uint8_t *)0x1080101F;
+        volatile uint8_t *clic_tmr_ie   = (uint8_t *)0x1080101D;
+
+        /* S-mode software interrupt for Linux IPI: edge, S-mode,
+         * same single level as all other S interrupts.  Do not leave it
+         * as reset default (ATTR=0 means U-mode level) or Linux never
+         * receives an SBI IPI and remote wakeups are lost.
+         */
+        clic_sipi_ip[0] = 0;
+        clic_sipi_ip[2] = S31_CLIC_ATTR_S_EDGE;
+        /* Linux replaces this with a native S-mode cross-hart IPI.  Keep
+         * the boot-time slot at the same non-nested level as every other
+         * S interrupt so no path can reintroduce CLIC priority nesting. */
+        clic_sipi_ip[3] = S31_CLIC_SINGLE_LEVEL;
+        clic_sipi_ip[1] = 1;
+
+        /* Linux owns runtime IPIs through native S-mode doorbells ID40/41.
+         * HSM startup uses a PSRAM state poll, so accepting ID3 in M-mode
+         * only creates an avoidable cross-privilege CLIC transition. */
+        clic_swi[1] = 0;                       /* IE: permanently disabled */
+        clic_swi[0] = 0;                       /* IP: discard stale request */
+        clic_swi[2] = S31_CLIC_ATTR_M_EDGE;
+        clic_swi[3] = S31_CLIC_SINGLE_LEVEL;
+
+        *clic_tmr_ip   = 0;
+        *clic_tmr_attr = S31_CLIC_ATTR_S_EDGE;
+        *clic_tmr_ctl  = S31_CLIC_SINGLE_LEVEL;
+        *clic_tmr_ie   = 1;
+
+}
+
 /* --- Platform init --- */
 static int esp32s31_early_init(bool cold_boot)
 {
-        if (!cold_boot)
+	sbi_console_set_device(&esp32s31_console);
+	esp32s31_pma_init();
+
+	/* ESP-IDF radio blobs use the S31 PIE extension in S-mode. */
+	csr_write(S31_CSR_MEXSTATUS, 1);
+
+        if (!cold_boot) {
+                esp32s31_clic_local_init();
                 return 0;
+        }
         // struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
         /* On S31 only the standard S-mode interrupt CSRs need emulation.
@@ -264,34 +480,10 @@ static int esp32s31_early_init(bool cold_boot)
          */
         writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
                S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
-        csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
+        csr_write(S31_CSR_MINTTHRESH, 0);
         csr_write(0x147, 0); /* sintthresh */
 
-        /* Configure CLIC M-mode interrupts for timer and software IPI.
-         * CLIC ID 3 = machine software interrupt (IPI across harts).
-         * CLIC ID 7 = machine timer interrupt (via SYSTIMER COMPx routing).
-         * MODE must be written explicitly. */
-        volatile uint8_t *clic_swi_attr = (uint8_t *)0x1080100E;
-        volatile uint8_t *clic_swi_ctl  = (uint8_t *)0x1080100F;
-        volatile uint8_t *clic_swi_ie   = (uint8_t *)0x1080100D;
-        volatile uint8_t *clic_tmr_ip   = (uint8_t *)0x1080101C;
-        volatile uint8_t *clic_tmr_attr = (uint8_t *)0x1080101E;
-        volatile uint8_t *clic_tmr_ctl  = (uint8_t *)0x1080101F;
-        volatile uint8_t *clic_tmr_ie   = (uint8_t *)0x1080101D;
-        /*
-         * Use one effective CLIC level (ctl=0x3f) for every interrupt.
-         * Privilege still determines M/S delivery, but the controller no
-         * longer exposes priority-based nesting within either mode.
-         */
-        *clic_swi_attr = S31_CLIC_ATTR_M_EDGE;
-        *clic_swi_ctl  = S31_CLIC_SINGLE_LEVEL;
-        /* This platform currently exposes one hart and has no IPI device. */
-        *clic_swi_ie   = 0;
-        /* Timer interrupt (ID 7): direct S-mode edge interrupt. */
-        *clic_tmr_ip   = 0;
-        *clic_tmr_attr = S31_CLIC_ATTR_S_EDGE;
-        *clic_tmr_ctl  = S31_CLIC_SINGLE_LEVEL;
-        *clic_tmr_ie   = 1;
+        esp32s31_clic_local_init();
 
         /* CLIC mode: CSR_TSELECT is readable but non-functional; force-disable SDTRIG */
         sbi_hart_update_extension(sbi_scratch_thishart_ptr(), SBI_HART_EXT_SDTRIG, false);
@@ -323,10 +515,9 @@ static int esp32s31_flash_ecall(unsigned long extid, unsigned long funcid,
 		    regs->a1 >= S31_PSRAM_LINUX_END ||
 		    length > S31_PSRAM_LINUX_END - regs->a1)
 			return SBI_ERR_INVALID_PARAM;
-                sbi_memcpy((void *)S31_DRAM_FLASH_BUFFER,
-                           (const void *)regs->a1, length);
+                sbi_memcpy(s31_flash_buffer, (const void *)regs->a1, length);
                 ret = ((s31_rom_flash_write_t)S31_ROM_FLASH_WRITE)(
-                        address, (const u32 *)S31_DRAM_FLASH_BUFFER, length);
+                        address, s31_flash_buffer, length);
                 break;
         case S31_SBI_FLASH_ERASE:
                 if ((address | length) & 0xfff)
@@ -396,6 +587,13 @@ static int esp32s31_extensions_init(bool cold_boot)
 	return generic_extensions_init(cold_boot);
 }
 
+/* The user-visible Linux boot hart must be hart 0; hart 1 is a secondary
+ * hart that Linux starts through SBI HSM. */
+static bool esp32s31_cold_boot_allowed(u32 hartid)
+{
+	return hartid == 0;
+}
+
 static bool esp32s31_single_fw_region(void)
 {
         /* XIP: Flash text + internal HP-SRAM data are physically separate,
@@ -415,7 +613,8 @@ static int esp32s31_timer_init(void)
         {
                 volatile uint8_t *clic_tmr = (uint8_t *)S31_CLIC_WORD(7);
 
-                writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
+                writel((readl((void *)S31_MCLICCFG) &
+                       ~S31_CLICCFG_NMBITS_MASK) |
                        S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
                 clic_tmr[0] = 0;                        /* IP: clear pending */
                 clic_tmr[2] = S31_CLIC_ATTR_S_EDGE;    /* ATTR: S-mode, edge */
@@ -455,9 +654,6 @@ static int esp32s31_final_init(bool cold_boot)
 	int ret;
 
 	if (cold_boot) {
-		/* Best-effort M-side gate in the last platform hook before Linux. */
-		csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
-
 		/* Register after generic platform setup, before SBI dispatch starts. */
 		ret = sbi_ecall_register_extension(&esp32s31_flash_ecall_ext);
 		if (ret)
@@ -484,6 +680,7 @@ static int esp32s31_platform_init(const void *fdt, int nodeoff,
                                   const struct fdt_match *match)
 {
         generic_platform_ops.single_fw_region = esp32s31_single_fw_region;
+        generic_platform_ops.cold_boot_allowed = esp32s31_cold_boot_allowed;
         generic_platform_ops.nascent_init    = esp32s31_noop_init;
         generic_platform_ops.early_init      = esp32s31_early_init;
         generic_platform_ops.extensions_init = esp32s31_extensions_init;
@@ -495,7 +692,7 @@ static int esp32s31_platform_init(const void *fdt, int nodeoff,
         generic_platform_ops.mpxy_init       = esp32s31_noop_init;
         /* Skip trap-based CSR probing on CLIC-only platforms */
         sbi_hart_priv_version_override = SBI_HART_PRIV_VER_1_10;
-        platform.hart_count = 1;
+        platform.hart_count = 2;
         platform.hart_stack_size = SBI_PLATFORM_DEFAULT_HART_STACK_SIZE;
         return 0;
 }
