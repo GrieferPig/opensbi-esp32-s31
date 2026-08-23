@@ -680,6 +680,18 @@ memcmp:
 
 .macro	TRAP_SAVE_INFO have_mstatush have_h_extension
 	csrr	t0, CSR_MCAUSE
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/*
+	 * Keep the hardware mcause return token untouched.  Only sanitize the
+	 * copy passed to C: CLIC metadata in bits [30:12] is not part of the
+	 * logical cause, while bit XLEN-1 remains the interrupt discriminator.
+	 */
+	li	t2, 0xfff
+	srli	t1, t0, (__riscv_xlen - 1)
+	slli	t1, t1, (__riscv_xlen - 1)
+	and	t0, t0, t2
+	or	t0, t0, t1
+#endif
 	REG_S	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(cause))(sp)
 	csrr	t0, CSR_MTVAL
 	REG_S	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(tval))(sp)
@@ -774,14 +786,10 @@ memcmp:
 
 .macro	TRAP_RESTORE_MEPC_MSTATUS have_mstatush
 	/*
-	 * Restore MCAUSE, MSTATUS and MEPC.  ESP32-S31 CLIC embeds the former
-	 * interrupt priority in MCAUSE, and mret copies it back to MINTSTATUS.
-	 * This must precede MSTATUS, matching ESP-IDF's CLIC return sequence.
+	 * trap->cause above is deliberately only a logical dispatch copy.  The
+	 * hardware MCAUSE remains the private mret token, matching Espressif's
+	 * SMCLIC trap path.
 	 */
-#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-	REG_L	t0, (SBI_TRAP_REGS_SIZE + SBI_TRAP_INFO_OFFSET(cause))(a0)
-	csrw	CSR_MCAUSE, t0
-#endif
 	/* Start with MSTATUS/H to set MDT when that extension is present. */
 	.if \have_mstatush
 	REG_L	t0, SBI_TRAP_REGS_OFFSET(mstatusH)(a0)

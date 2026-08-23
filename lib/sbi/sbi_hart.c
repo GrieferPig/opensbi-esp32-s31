@@ -880,10 +880,6 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 #endif
 	csr_write(CSR_MSTATUS, val);
 	csr_write(CSR_MEPC, next_addr);
-	sbi_printf("S31 switch: hart%u satp=%lx sintstatus=%lx next_addr=%lx next_mode=%lu\n",
-		   current_hartid(), csr_read(CSR_SATP), csr_read(0xdb1),
-		   next_addr, next_mode);
-
 	if (next_mode == PRV_S) {
 		if (next_virt) {
 			csr_write(CSR_VSTVEC, next_addr);

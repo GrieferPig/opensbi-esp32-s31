@@ -26,6 +26,11 @@ __sbi_expected_trap:
 	li	a4, MSTATUS_MPRV
 	csrc	CSR_MSTATUS, a4
 	csrr	a4, CSR_MCAUSE
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/* Expected traps are synchronous; keep only their logical cause code. */
+	slli	a4, a4, (__riscv_xlen - 12)
+	srli	a4, a4, (__riscv_xlen - 12)
+#endif
 	REG_S	a4, SBI_TRAP_INFO_OFFSET(cause)(a3)
 	csrr	a4, CSR_MTVAL
 	REG_S	a4, SBI_TRAP_INFO_OFFSET(tval)(a3)
@@ -44,6 +49,11 @@ __sbi_expected_trap_hext:
 	li	a4, MSTATUS_MPRV
 	csrc	CSR_MSTATUS, a4
 	csrr	a4, CSR_MCAUSE
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+	/* Expected traps are synchronous; keep only their logical cause code. */
+	slli	a4, a4, (__riscv_xlen - 12)
+	srli	a4, a4, (__riscv_xlen - 12)
+#endif
 	REG_S	a4, SBI_TRAP_INFO_OFFSET(cause)(a3)
 	csrr	a4, CSR_MTVAL
 	REG_S	a4, SBI_TRAP_INFO_OFFSET(tval)(a3)

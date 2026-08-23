@@ -45,6 +45,7 @@ extern unsigned int sbi_hart_priv_version_override;
 #define S31_ROM_FLASH_ERASE      0x2f800174UL
 #define S31_ROM_FLASH_UNLOCK     0x2f800170UL
 #define S31_FLASH_SIZE           0x01000000UL
+#define S31_FLASH_XIP_START      0x40000000UL
 #define S31_PSRAM_LINUX_START    0x50000000UL
 /* Exclusive end of the complete 16-MiB Linux PSRAM memory node. */
 #define S31_PSRAM_LINUX_END      0x51000000UL
@@ -65,6 +66,30 @@ typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 typedef int (*s31_rom_flash_unlock_t)(void);
 typedef void (*s31_rom_software_reset_system_t)(void);
 
+/* Official ESP32-S31 port cache ABI.  S-mode must not program the external
+ * cache controller directly: delegate the operation to these ROM helpers in
+ * M-mode through the platform vendor SBI extension. */
+typedef int (*s31_rom_cache_range_t)(u32 map, u32 address, u32 size);
+typedef int (*s31_rom_cache_all_t)(u32 map);
+
+#define S31_ROM_CACHE_INVALIDATE_ADDR 0x2f8005e8UL
+#define S31_ROM_CACHE_WRITEBACK_ADDR  0x2f8005f0UL
+#define S31_ROM_CACHE_INVALIDATE_ALL  0x2f8005f8UL
+#define S31_ROM_CACHE_WRITEBACK_ALL   0x2f800600UL
+
+#define S31_CACHE_MAP_ICACHE0         BIT(0)
+#define S31_CACHE_MAP_ICACHE1         BIT(1)
+#define S31_CACHE_MAP_ICACHE          \
+	(S31_CACHE_MAP_ICACHE0 | S31_CACHE_MAP_ICACHE1)
+#define S31_CACHE_MAP_DCACHE          BIT(4)
+
+#define S31_SBI_CACHE_WBACK           0
+#define S31_SBI_CACHE_INVAL           1
+#define S31_SBI_CACHE_WBACK_INVAL     2
+#define S31_SBI_ICACHE_SYNC           3
+#define S31_SBI_ICACHE_SYNC_RANGE     4
+#define S31_SBI_DCACHE_WBACK_ALL      5
+
 /*
  * ROM Wi-Fi/PP globals occupy 0x2f07fc3c..0x2f07ffa8, including xphyQueue,
  * pp_task_hdl, s_wifi_queue, and the registered netstack callbacks.  A former
@@ -73,6 +98,85 @@ typedef void (*s31_rom_software_reset_system_t)(void);
  * the SBI flash extension is serialized by Linux and runs on the sole hart.
  */
 static u32 s31_flash_buffer[8];
+
+static bool esp32s31_cache_range_valid(u32 address, u32 size)
+{
+	if (!size)
+		return false;
+	if (address >= S31_FLASH_XIP_START && size <= S31_FLASH_SIZE &&
+	    address - S31_FLASH_XIP_START <= S31_FLASH_SIZE - size)
+		return true;
+	if (address >= S31_PSRAM_LINUX_START &&
+	    size <= S31_PSRAM_LINUX_END - S31_PSRAM_LINUX_START &&
+	    address - S31_PSRAM_LINUX_START <=
+		S31_PSRAM_LINUX_END - S31_PSRAM_LINUX_START - size)
+		return true;
+	return false;
+}
+
+static void esp32s31_cache_range(unsigned long rom_address, u32 map,
+				 u32 address, u32 size)
+{
+	((s31_rom_cache_range_t)rom_address)(map, address, size);
+}
+
+static int esp32s31_cache_vendor_ext(long funcid,
+				     struct sbi_trap_regs *regs,
+				     struct sbi_ecall_return *out)
+{
+	u32 address = (u32)regs->a0;
+	u32 size = (u32)regs->a1;
+
+	switch (funcid) {
+	case S31_SBI_CACHE_WBACK:
+	case S31_SBI_CACHE_INVAL:
+	case S31_SBI_CACHE_WBACK_INVAL:
+	case S31_SBI_ICACHE_SYNC_RANGE:
+		if (!esp32s31_cache_range_valid(address, size))
+			return SBI_ERR_INVALID_PARAM;
+		break;
+	}
+
+	switch (funcid) {
+	case S31_SBI_CACHE_WBACK:
+		esp32s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+				       S31_CACHE_MAP_DCACHE, address, size);
+		break;
+	case S31_SBI_CACHE_INVAL:
+		esp32s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+				       S31_CACHE_MAP_DCACHE, address, size);
+		break;
+	case S31_SBI_CACHE_WBACK_INVAL:
+		esp32s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+				       S31_CACHE_MAP_DCACHE, address, size);
+		esp32s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+				       S31_CACHE_MAP_DCACHE, address, size);
+		break;
+	case S31_SBI_ICACHE_SYNC:
+		((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
+			S31_CACHE_MAP_DCACHE);
+		((s31_rom_cache_all_t)S31_ROM_CACHE_INVALIDATE_ALL)(
+			S31_CACHE_MAP_ICACHE);
+		break;
+	case S31_SBI_ICACHE_SYNC_RANGE:
+		if (address >= S31_PSRAM_LINUX_START)
+			esp32s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+					       S31_CACHE_MAP_DCACHE,
+					       address, size);
+		esp32s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+				       S31_CACHE_MAP_ICACHE, address, size);
+		break;
+	case S31_SBI_DCACHE_WBACK_ALL:
+		((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
+			S31_CACHE_MAP_DCACHE);
+		break;
+	default:
+		return SBI_ENOTSUPP;
+	}
+
+	out->value = 0;
+	return 0;
+}
 
 static void __noreturn esp32s31_reboot(void)
 {
@@ -156,7 +260,6 @@ void sbi_platform_console_release(void)
  * not hit the shared D-cache.  Matches the bootloader/head.S sequence.
  */
 #define S31_CACHE_BASE            0x2c000000UL
-#define S31_CACHE_MAP_DCACHE      0x10
 #define S31_CACHE_WRITEBACK_ENA   0x4
 
 void sbi_platform_warmboot_sync(void)
@@ -193,7 +296,9 @@ void sbi_platform_hsm_start_sync(u32 hartid)
 #define S31_INTMATRIX_LAST_MAP  0x2a0UL
 #define S31_CLIC_ATTR_S_EDGE    0x42
 #define S31_CLIC_ATTR_M_EDGE    0xc2
-#define S31_CLIC_SINGLE_LEVEL   0x3f
+/* Match Espressif's CLIC port: all delegated S-mode sources use the
+ * highest implemented level (7) and remain non-nested while SIE is clear. */
+#define S31_CLIC_SINGLE_LEVEL   0xe0
 #define S31_CSR_MINTTHRESH      0x347
 #define S31_CSR_MEXSTATUS       0x7f2
 #define S31_CSR_PMACFG0         0xbc0
@@ -258,75 +363,6 @@ static struct sbi_timer_device esp32s31_timer = {
         .timer_event_stop = esp32s31_timer_event_stop,
 };
 
-/*
- * Keep a persistent, per-hart record of every M-mode trap.  S31 enters
- * OpenSBI not only for M-mode CLIC interrupts but also for undelegatable
- * U/S ecalls.  Recording both is required to identify which privilege
- * crossing first leaves SINTSTATUS.SIL at the 0xff sentinel.
- * OpenOCD can locate s31_mtrap_debug in fw_jump.elf.  Halt both harts and
- * write back the shared D-cache before reading its physical PSRAM address.
- * Recording happens before OpenSBI dispatch, so an unhandled raw ID such as
- * ID21 and the immediately preceding synchronous crossings are preserved
- * even if the firmware subsequently parks in trap error.
- */
-#define S31_MTRAP_DEBUG_MAGIC   0x4d545233U /* "MTR3" */
-#define S31_MTRAP_DEBUG_HARTS   2
-#define S31_MTRAP_DEBUG_IDS     48
-#define S31_MTRAP_DEBUG_EVENTS  16
-
-struct s31_mtrap_event {
-        u32 sequence;
-        u32 raw_mcause;
-        u32 mepc;
-        u32 mstatus;
-        u32 clic_word;
-};
-
-struct s31_mtrap_record {
-        u32 magic;
-        u32 total;
-        u32 head;
-        u32 last_id;
-        u32 counts[S31_MTRAP_DEBUG_IDS];
-        struct s31_mtrap_event events[S31_MTRAP_DEBUG_EVENTS];
-};
-
-volatile struct s31_mtrap_record
-s31_mtrap_debug[S31_MTRAP_DEBUG_HARTS];
-
-void esp32s31_record_m_interrupt(ulong raw_mcause,
-                                 const struct sbi_trap_regs *regs)
-{
-        u32 hartid = current_hartid();
-        u32 id = raw_mcause & 0xfff;
-        volatile struct s31_mtrap_record *record;
-        volatile struct s31_mtrap_event *event;
-        u32 sequence;
-
-        if (hartid >= S31_MTRAP_DEBUG_HARTS)
-                return;
-
-        record = &s31_mtrap_debug[hartid];
-        sequence = record->total + 1;
-        event = &record->events[record->head &
-                                (S31_MTRAP_DEBUG_EVENTS - 1)];
-
-        event->raw_mcause = raw_mcause;
-        event->mepc = regs->mepc;
-        event->mstatus = regs->mstatus;
-        event->clic_word = (raw_mcause & MCAUSE_IRQ_MASK) && id < 128 ?
-                readl((void *)S31_CLIC_WORD(id)) : 0;
-        event->sequence = sequence;
-
-        if (id < S31_MTRAP_DEBUG_IDS)
-                record->counts[id]++;
-        record->last_id = id;
-        record->head++;
-        record->magic = S31_MTRAP_DEBUG_MAGIC;
-        RISCV_FENCE(w, w);
-        record->total = sequence;
-}
-
 /* --- misa override: RV32IMAFBCNSUX --- */
 static int esp32s31_misa_extension(char ext)
 {
@@ -377,8 +413,8 @@ static void esp32s31_clic_local_init(void)
 {
         esp32s31_clic_local_reset();
 
-        /* Linux aggregates timer and IPI into one S-mode slot per hart;
-         * keep the controller in the non-nested configuration. */
+	/* Linux uses dedicated timer and IPI S-mode slots per hart; both retain
+	 * the official single-level, non-nested policy. */
         writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
                S31_CLICCFG_NMBITS_1, (void *)S31_MCLICCFG);
         csr_write(S31_CSR_MINTTHRESH, S31_CLIC_SINGLE_LEVEL);
@@ -475,7 +511,7 @@ static int esp32s31_early_init(bool cold_boot)
          * ESP-IDF defines INTTHRESH_STANDARD=1 for S31, so the machine
          * threshold is CSR 0x347 and contains the left-aligned threshold
          * byte directly.  The S-mode threshold remains zero so the direct S
-         * interrupts at ctl=0x3f are accepted when no S handler is active;
+		 * interrupts at ctl=0xe0 are accepted when no S handler is active;
          * their active level then naturally blocks same-level nesting.
          */
         writel((readl((void *)S31_MCLICCFG) & ~S31_CLICCFG_NMBITS_MASK) |
@@ -637,7 +673,7 @@ static int esp32s31_timer_init(void)
 
                         ext[0] = 0;                     /* IP: clear */
                         ext[2] = s_level_attr;          /* ATTR: S-mode, level */
-                        ext[3] = S31_CLIC_SINGLE_LEVEL; /* CTL: level 1 */
+			ext[3] = S31_CLIC_SINGLE_LEVEL; /* CTL: maximum level 7 */
                         ext[1] = 0;                     /* IE: off (Linux enables) */
                 }
         }
@@ -690,6 +726,9 @@ static int esp32s31_platform_init(const void *fdt, int nodeoff,
         generic_platform_ops.irqchip_init    = esp32s31_noop_init;
         generic_platform_ops.timer_init      = esp32s31_timer_init;
         generic_platform_ops.mpxy_init       = esp32s31_noop_init;
+	/* Match the official port: cache maintenance is an M-mode service, not
+	 * direct S-mode cache-controller register access. */
+	generic_platform_ops.vendor_ext_provider = esp32s31_cache_vendor_ext;
         /* Skip trap-based CSR probing on CLIC-only platforms */
         sbi_hart_priv_version_override = SBI_HART_PRIV_VER_1_10;
         platform.hart_count = 2;

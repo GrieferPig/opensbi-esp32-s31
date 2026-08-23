@@ -27,11 +27,6 @@
 #include <sbi/sbi_timer.h>
 #include <sbi/sbi_trap.h>
 
-#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-void esp32s31_record_m_interrupt(ulong raw_mcause,
-				 const struct sbi_trap_regs *regs);
-#endif
-
 static void sbi_trap_error_one(const struct sbi_trap_context *tcntx,
 			       const char *prefix, u32 hartid, u32 depth)
 {
@@ -329,28 +324,18 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	const struct sbi_trap_info *trap = &tcntx->trap;
 	struct sbi_trap_regs *regs = &tcntx->regs;
-	/*
-	 * Keep S31's raw CLIC return token in tcntx->trap.cause.  Dispatch uses a
-	 * separate logical cause so firmware code can never accidentally feed a
-	 * masked ID back to mret in place of the hardware nesting state.
-	 */
-	ulong raw_mcause = tcntx->trap.cause;
-	ulong logical_mcause = raw_mcause;
+	ulong mcause = tcntx->trap.cause;
 
 	/* Update trap context pointer */
 	tcntx->prev_context = sbi_trap_get_context(scratch);
 	sbi_trap_set_context(scratch, tcntx);
 
-#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-	esp32s31_record_m_interrupt(raw_mcause, regs);
-#endif
-
-	if (raw_mcause & MCAUSE_IRQ_MASK) {
+	if (mcause & MCAUSE_IRQ_MASK) {
 		if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
 					   SBI_HART_EXT_SMAIA))
 			rc = sbi_trap_aia_irq();
 		else
-			rc = sbi_trap_nonaia_irq(logical_mcause & 0xfff);
+			rc = sbi_trap_nonaia_irq(mcause & 0xfff);
 		msg = "unhandled local interrupt";
 		goto trap_done;
 	}
@@ -361,9 +346,9 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 	 * the standard code range so that the switch cases still match.
 	 * Use 0xfff to preserve CLIC interrupt IDs up to 47 (external IRQs
 	 * are IDs 16-47).  Do NOT use & 0xF which truncates IDs >= 16. */
-	logical_mcause &= 0xfff;
+	mcause &= 0xfff;
 
-	switch (logical_mcause) {
+	switch (mcause) {
 	case CAUSE_ILLEGAL_INSTRUCTION:
 		rc  = sbi_illegal_insn_handler(tcntx);
 		msg = "illegal instruction handler failed";
@@ -413,18 +398,6 @@ struct sbi_trap_context *sbi_trap_handler(struct sbi_trap_context *tcntx)
 trap_done:
 	if (rc)
 		sbi_trap_error(msg, rc, tcntx);
-
-#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
-	/*
-	 * Only CLIC interrupts carry a priority stack entry that must be
-	 * restored through mcause before mret.  Synchronous traps (notably the
-	 * frequent S-mode timer SBI ecall) carry cross-privilege metadata that
-	 * is not a restorable interrupt level.  Returning it verbatim leaks
-	 * the S31 0xff sentinel into SIL and eventually blocks all S IRQs.
-	 */
-	if (!(tcntx->trap.cause & MCAUSE_IRQ_MASK))
-		tcntx->trap.cause &= 0xfff;
-#endif
 
 	if (sbi_mstatus_prev_mode(regs->mstatus) != PRV_M)
 		sbi_sse_process_pending_events(regs);

@@ -13,6 +13,7 @@
 #include <sbi/sbi_emulate_csr.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_hart.h>
+#include <sbi/sbi_hartmask.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_timer.h>
 #include <sbi/sbi_trap.h>
@@ -178,11 +179,13 @@ int sbi_emulate_csr_write(int csr_num, struct sbi_trap_regs *regs,
 	return ret;
 }
 
-/*
- * Shadow S-mode CSR storage for the subset of S-mode CSRs that still trap
- * from M-mode on ESP32-S31. CSR numbers 0x100-0x1FF map to indices 0-255.
- */
-static ulong sbi_scsr_shadow[256];
+/* Per-hart caches, matching the official CLIC CSR-emulation model. */
+static ulong sbi_sie_cache[SBI_HARTMASK_MAX_BITS];
+static ulong sbi_sip_cache[SBI_HARTMASK_MAX_BITS];
+#if __riscv_xlen == 32
+static ulong sbi_sieh_cache[SBI_HARTMASK_MAX_BITS];
+static ulong sbi_siph_cache[SBI_HARTMASK_MAX_BITS];
+#endif
 
 bool sbi_scsr_needs_shadow(int csr_num)
 {
@@ -293,13 +296,48 @@ ulong sbi_scsr_swap(int csr_num, ulong val)
 
 void sbi_scsr_shadow_write(int csr_num, ulong val)
 {
-	if (csr_num >= 0x100 && csr_num < 0x200)
-		sbi_scsr_shadow[csr_num - 0x100] = val;
+	ulong hartid = current_hartid();
+
+	if (hartid >= SBI_HARTMASK_MAX_BITS)
+		return;
+	switch (csr_num) {
+	case CSR_SIE:
+		sbi_sie_cache[hartid] = val;
+		break;
+	case CSR_SIP:
+		sbi_sip_cache[hartid] = val;
+		break;
+#if __riscv_xlen == 32
+	case CSR_SIEH:
+		sbi_sieh_cache[hartid] = val;
+		break;
+	case CSR_SIPH:
+		sbi_siph_cache[hartid] = val;
+		break;
+#endif
+	default:
+		break;
+	}
 }
 
 ulong sbi_scsr_shadow_read(int csr_num)
 {
-	if (csr_num >= 0x100 && csr_num < 0x200)
-		return sbi_scsr_shadow[csr_num - 0x100];
-	return 0;
+	ulong hartid = current_hartid();
+
+	if (hartid >= SBI_HARTMASK_MAX_BITS)
+		return 0;
+	switch (csr_num) {
+	case CSR_SIE:
+		return sbi_sie_cache[hartid];
+	case CSR_SIP:
+		return sbi_sip_cache[hartid];
+#if __riscv_xlen == 32
+	case CSR_SIEH:
+		return sbi_sieh_cache[hartid];
+	case CSR_SIPH:
+		return sbi_siph_cache[hartid];
+#endif
+	default:
+		return 0;
+	}
 }
