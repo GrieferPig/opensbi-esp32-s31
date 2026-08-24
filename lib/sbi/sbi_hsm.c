@@ -152,9 +152,6 @@ void __noreturn sbi_hsm_hart_start_finish(struct sbi_scratch *scratch,
 	next_arg1 = scratch->next_arg1;
 	next_addr = scratch->next_addr;
 	next_mode = scratch->next_mode;
-	if (hartid == 0)
-		sbi_printf("S31 HSM: finish hart%u scratch=%p next_addr=%lx arg1=%lx mode=%lx\n",
-			   hartid, scratch, next_addr, next_arg1, next_mode);
 	hsm_start_ticket_release(hdata);
 
 	sbi_hart_switch_mode(hartid, next_arg1, next_addr, next_mode, false);
@@ -366,9 +363,6 @@ int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 	rscratch->next_arg1 = arg1;
 	rscratch->next_addr = saddr;
 	rscratch->next_mode = smode;
-
-	sbi_printf("S31 HSM: start hart%u rscratch=%p saddr=%lx arg1=%lx smode=%lx\n",
-		   hartid, rscratch, saddr, arg1, smode);
 
 	/*
 	 * atomic_cmpxchg() is an implicit barrier. It makes sure that

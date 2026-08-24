@@ -2,16 +2,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Copyright (c) 2019 Western Digital Corporation or its affiliates.
- * Modified for ESP32-S31 Flash XIP + internal HP-SRAM data.
+ * Modified for ESP32-S31 Flash XIP or U-Boot SPL + split writable data.
  *
  * Authors:
  *   Anup Patel <anup.patel@wdc.com>
  */
 
-	ASSERT(FW_TEXT_START == 0x40220000,
-		"FW_TEXT_START must be ESP32-S31 partition mapped base")
-	ASSERT(FW_RW_START == 0x50FF0000,
-		"FW_RW_START must be the final ESP32-S31 PSRAM MMU page")
+	ASSERT(FW_TEXT_START == 0x40220000 || FW_TEXT_START == 0x40000400 ||
+	       FW_TEXT_START == 0x2F000000,
+		"FW_TEXT_START must be a supported ESP32-S31 XIP/SPL load base")
+	ASSERT((FW_TEXT_START == 0x40220000 && FW_RW_START == 0x50FF0000) ||
+	       (FW_TEXT_START == 0x40000400 && FW_RW_START == 0x2F00F000) ||
+	       (FW_TEXT_START == 0x2F000000 && FW_RW_START == 0x2F021000),
+		"FW_RW_START must match the selected ESP32-S31 boot layout")
 
 
 	. = FW_TEXT_START;
@@ -64,13 +67,13 @@
 	/* End of the read-only data sections */
 
 	/*
-	 * Flash-resident data (LMA) will be copied to reserved PSRAM (VMA).
+	 * Image-resident data (LMA) is copied to reserved writable RAM (VMA).
 	 * LMA is placed immediately after .rela.dyn so the binary
 	 * layout stays contiguous (objcopy won't insert a gap).
 	 */
 	PROVIDE(__data_flash_start = ADDR(.rela.dyn) + SIZEOF(.rela.dyn));
 
-	. = FW_RW_START;                  /* switch to reserved PSRAM VMA */
+	. = FW_RW_START;                  /* switch to reserved writable VMA */
 
 	PROVIDE(_fw_rw_start = .);
 
@@ -90,6 +93,9 @@
 
 		PROVIDE(_data_end = .);
 	}
+	ASSERT(LOADADDR(.data) + SIZEOF(.data) <= ADDR(.data) ||
+	       ADDR(.data) + SIZEOF(.data) <= LOADADDR(.data),
+	       "ESP32-S31 OpenSBI .data relocation source overlaps destination")
 
 	. = ALIGN(0x1000); /* Ensure next section is page aligned */
 
@@ -109,5 +115,7 @@
 	. = ALIGN(0x1000); /* Need this to create proper sections */
 
 	PROVIDE(_fw_end = .);
-	ASSERT(_fw_end <= FW_RW_START + 0x10000,
-	       "ESP32-S31 OpenSBI RW must fit in 64 KiB")
+	/* Runtime layout after _fw_end is two 4-KiB hart stacks followed by the
+	 * 16-KiB heap selected in the U-Boot control DT. */
+	ASSERT(_fw_end <= FW_RW_START + 0x3000,
+	       "ESP32-S31 OpenSBI image must leave room for stacks and heap")

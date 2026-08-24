@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: BSD-2-Clause
+
+CONFIG_PLATFORM_ESPRESSIF_ESP32S31=y
+CONFIG_SMCLIC=y
+CONFIG_DEFAULT_HART_STACK_SIZE=4096
+# Harts without the mstatush CSR trap on the MDT clear
+# CONFIG_SMDBLTRP is not set
+
+CONFIG_FDT_IRQCHIP=y
+CONFIG_FDT_IRQCHIP_CLIC=y
+
+CONFIG_FDT_IPI=y
+CONFIG_FDT_TIMER=y
+
+CONFIG_FDT_SERIAL=y
+CONFIG_FDT_SERIAL_ESPRESSIF=y
+
+# Experimental SBI extensions disabled -- not exercised by RV32 Linux boot.
+# CONFIG_SBI_ECALL_FWFT is not set
+# CONFIG_SBI_ECALL_DBTR is not set
+# CONFIG_SBI_ECALL_SSE is not set
+# CONFIG_SBI_ECALL_SUSP is not set
+# CONFIG_SBI_ECALL_PMU is not set
+# CONFIG_SBI_ECALL_CPPC is not set
+# CONFIG_SBI_ECALL_LEGACY is not set
+# CONFIG_SBI_ECALL_MPXY is not set

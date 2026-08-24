@@ -547,6 +547,14 @@ static int hart_detect_features(struct sbi_scratch *scratch, bool cold_boot)
 	 */
 	if (sbi_hart_priv_version_override) {
 		hfeatures->priv_version = sbi_hart_priv_version_override;
+		/* ESP32-S31 implements 16 standard PMP entries with 4-byte
+		 * granularity.  Trap-based feature probing is unsafe on its CLIC,
+		 * but the known PMP geometry is still required so OpenSBI can
+		 * install the root-domain allow rule expected by the official
+		 * U-Boot handoff. */
+		hfeatures->pmp_log2gran = PMP_SHIFT;
+		hfeatures->pmp_addr_bits = 32;
+		hfeatures->pmp_count = 16;
 		goto skip_priv_detect;
 	}
 
@@ -798,21 +806,17 @@ int sbi_hart_init(struct sbi_scratch *scratch, bool cold_boot)
 			return SBI_ENOMEM;
 	}
 
-	/*
-	 * On CLIC-only platforms (ESP32-S31), csr_read_allowed traps
-	 * don't work.  If the platform has pre-set a privilege version,
-	 * skip hart_detect_features and PMP init entirely.
-	 */
-	if (!sbi_hart_priv_version_override) {
-		rc = hart_detect_features(scratch, cold_boot);
+	/* hart_detect_features() has an ESP32-S31-safe known-feature path;
+	 * keep the common PMP backend registration and per-hart configuration
+	 * active even when trap-based CSR probing is bypassed. */
+	rc = hart_detect_features(scratch, cold_boot);
+	if (rc)
+		return rc;
+
+	if (cold_boot) {
+		rc = sbi_hart_pmp_init(scratch);
 		if (rc)
 			return rc;
-
-		if (cold_boot) {
-			rc = sbi_hart_pmp_init(scratch);
-			if (rc)
-				return rc;
-		}
 	}
 
 	rc = delegate_traps(scratch);
@@ -904,12 +908,6 @@ sbi_hart_switch_mode(unsigned long arg0, unsigned long arg1,
 			csr_write(CSR_UIE, 0);
 		}
 	}
-
-	/* Release the platform console/UART before the next mode runs.
-	 * On ESP32-S31 OpenSBI owns the polling UART; Linux earlycon/console
-	 * needs it handed off cleanly.
-	 */
-	sbi_platform_console_release();
 
 	register unsigned long a0_reg asm("a0") = arg0_saved;
 	register unsigned long a1_reg asm("a1") = arg1_saved;

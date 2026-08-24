@@ -62,10 +62,20 @@ _start:
 	csrr	a0, CSR_MHARTID
 	li	t0, 1
 	bltu	t0, a0, _start_hang
+	/* The U-Boot SMP extension releases hart1 only after hart0 has published
+	 * the coldboot state.  A late secondary has no fw_dynamic info pointer and
+	 * must not call fw_boot_hart(); wait for the boot hart and join warmboot.
+	 * This is also safe for the legacy simultaneous-entry path.
+	 */
+	bnez	a0, _wait_for_boot_hart
 
 	/*
-	 * Flash XIP: copy .data from Flash (LMA) to cached PSRAM (VMA) *before*
-	 * the lottery so _boot_lottery is zero.  Uses t0-t2 only.
+	 * Copy .data from the image LMA to its writable VMA before the lottery.
+	 * The legacy loader sources it from XIP flash; U-Boot SPL sources it from
+	 * the OpenSBI image already copied into HP SRAM.  Under the U-Boot SMP
+	 * handoff hart1 is released after coldboot has initialized OpenSBI state,
+	 * so it must not restore the link-time image over that live state.
+	 * Uses t0-t3 only.
 	 */
 	lla	t0, __data_flash_start
 	lla	t1, _data_start
