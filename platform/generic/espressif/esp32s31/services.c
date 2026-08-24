@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 #include <sbi/sbi_ecall.h>
 #include <sbi/sbi_error.h>
+#include <sbi/riscv_asm.h>
 #include <sbi/sbi_string.h>
 #include <sbi/sbi_system.h>
 
@@ -8,7 +9,6 @@
 
 #define S31_ROM_FLASH_WRITE		0x2f800168UL
 #define S31_ROM_FLASH_ERASE		0x2f800174UL
-#define S31_ROM_FLASH_UNLOCK		0x2f800170UL
 #define S31_ROM_SOFTWARE_RESET_SYSTEM	0x2f800094UL
 #define S31_SBI_EXT_FLASH		0x09000000UL
 #define S31_SBI_FLASH_WRITE		0
@@ -19,12 +19,85 @@
 #define S31_SBI_COPROC_RESTORE		2
 #define S31_COPROC_STATE_SIZE		256UL
 
-typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer, s32 length);
-typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
-typedef int (*s31_rom_flash_unlock_t)(void);
 typedef void (*s31_rom_software_reset_system_t)(void);
+typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
+				     s32 length);
+typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
+
+/*
+ * The legacy ROM SPIWrite/SPIEraseArea implementation is not compatible with
+ * flash auto-suspend. ESP-IDF deliberately excludes that combination and,
+ * when caches are disabled on SMP, parks the other core in internal RAM.
+ *
+ * Do the equivalent here using the SoC's hart-stall control, then run the
+ * synchronous ROM operation from an SRAM-resident wrapper with auto-suspend
+ * temporarily disabled. No hart can fetch XIP until the operation is complete,
+ * so the ROM implementation cannot return into a suspended/partially-readable
+ * flash window.
+ */
+#define S31_SPI1_FLASH_SUS_CTRL		0x2050109cUL
+#define S31_SPI1_AUTO_RESUME_EN		BIT(4)
+#define S31_SPI1_AUTO_SUSPEND_EN	BIT(5)
+#define S31_HP_CORESTALLED_ST		0x20586064UL
+#define S31_PMU_CPU_STALL_SW		0x207041ecUL
+#define S31_PMU_STALL_CODE		0x86U
+#define S31_PMU_STALL_TIMEOUT_CYCLES	32000000U
 
 static u32 s31_flash_buffer[8];
+
+static inline u32 s31_flash_rdcycle(void)
+{
+	u32 value;
+
+	__asm__ __volatile__("csrr %0, cycle" : "=r" (value));
+	return value;
+}
+
+static int __attribute__((section(".data.s31_flash_text"), noinline))
+s31_flash_rom_operation(u32 funcid, u32 address, const u32 *buffer, u32 length)
+{
+	volatile u32 *sus_ctrl = (volatile u32 *)S31_SPI1_FLASH_SUS_CTRL;
+	volatile u32 *stall_ctrl = (volatile u32 *)S31_PMU_CPU_STALL_SW;
+	volatile u32 *stall_status = (volatile u32 *)S31_HP_CORESTALLED_ST;
+	u32 peer = current_hartid() ^ 1U;
+	u32 stall_shift = peer ? 16 : 24;
+	u32 stall_mask = 0xffU << stall_shift;
+	u32 stall_bit = BIT(peer);
+	u32 saved_stall_ctrl = *stall_ctrl;
+	u32 saved_sus_ctrl = *sus_ctrl;
+	u32 start;
+	int ret;
+
+	*stall_ctrl = (saved_stall_ctrl & ~stall_mask) |
+		(S31_PMU_STALL_CODE << stall_shift);
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	start = s31_flash_rdcycle();
+	while (!(*stall_status & stall_bit)) {
+		if ((u32)(s31_flash_rdcycle() - start) >
+		    S31_PMU_STALL_TIMEOUT_CYCLES) {
+			*stall_ctrl = saved_stall_ctrl;
+			return 2;
+		}
+	}
+
+	*sus_ctrl = saved_sus_ctrl &
+		~(S31_SPI1_AUTO_RESUME_EN | S31_SPI1_AUTO_SUSPEND_EN);
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	if (funcid == S31_SBI_FLASH_ERASE)
+		ret = ((s31_rom_flash_erase_t)S31_ROM_FLASH_ERASE)(address,
+								 length);
+	else
+		ret = ((s31_rom_flash_write_t)S31_ROM_FLASH_WRITE)(address,
+								 buffer, length);
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	*sus_ctrl = saved_sus_ctrl;
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	*stall_ctrl = saved_stall_ctrl;
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	while (*stall_status & stall_bit)
+		;
+	return ret;
+}
 
 static int s31_flash_ecall(unsigned long extid, unsigned long funcid,
 			   struct sbi_trap_regs *regs,
@@ -37,12 +110,6 @@ static int s31_flash_ecall(unsigned long extid, unsigned long funcid,
 	if (!length || address >= S31_FLASH_SIZE ||
 	    length > S31_FLASH_SIZE - address)
 		return SBI_ERR_INVALID_PARAM;
-	ret = ((s31_rom_flash_unlock_t)S31_ROM_FLASH_UNLOCK)();
-	if (ret) {
-		out->value = ret;
-		return SBI_ERR_FAILED;
-	}
-
 	switch (funcid) {
 	case S31_SBI_FLASH_WRITE:
 		if ((address | regs->a1 | length) & 3 || length > 32 ||
@@ -51,18 +118,17 @@ static int s31_flash_ecall(unsigned long extid, unsigned long funcid,
 		    length > S31_PSRAM_LINUX_END - regs->a1)
 			return SBI_ERR_INVALID_PARAM;
 		sbi_memcpy(s31_flash_buffer, (const void *)regs->a1, length);
-		ret = ((s31_rom_flash_write_t)S31_ROM_FLASH_WRITE)(
-			address, s31_flash_buffer, length);
 		break;
 	case S31_SBI_FLASH_ERASE:
 		if ((address | length) & 0xfff)
 			return SBI_ERR_INVALID_PARAM;
-		ret = ((s31_rom_flash_erase_t)S31_ROM_FLASH_ERASE)(address,
-								 length);
 		break;
 	default:
 		return SBI_ERR_NOT_SUPPORTED;
 	}
+	ret = s31_flash_rom_operation(funcid, address,
+			funcid == S31_SBI_FLASH_WRITE ? s31_flash_buffer : NULL,
+			length);
 	out->value = ret;
 	return ret ? SBI_ERR_FAILED : SBI_SUCCESS;
 }
