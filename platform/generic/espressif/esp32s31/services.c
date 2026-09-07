@@ -4,6 +4,7 @@
 #include <sbi/sbi_console.h>
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_io.h>
+#include <sbi/sbi_ipi.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_string.h>
 #include <sbi/sbi_system.h>
@@ -330,6 +331,14 @@ s31_flash_rom_operation(u32 funcid, u32 address, const u32 *buffer, u32 length)
 	*stall_ctrl = (saved_stall_ctrl & ~stall_mask) |
 		(S31_PMU_STALL_CODE << stall_shift);
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	/*
+	 * A hart which is already in WFI does not observe the PMU software-stall
+	 * request until it wakes.  Flash writes from JFFS2 commonly arrive while
+	 * the other CPU is idle, so kick its M-mode IPI source after arming the
+	 * stall.  The pending stall then catches the peer before any XIP mapping is
+	 * changed by the ROM operation.
+	 */
+	sbi_ipi_raw_send(sbi_hartid_to_hartindex(peer), false);
 	start = s31_flash_rdcycle();
 	while (!(*stall_status & stall_bit)) {
 		if ((u32)(s31_flash_rdcycle() - start) >
