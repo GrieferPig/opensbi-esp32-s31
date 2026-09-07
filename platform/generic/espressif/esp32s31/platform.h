@@ -24,12 +24,14 @@ void s31_apm_init(void);
 void s31_tee_supervisor_priv_sel_to_m(void);
 int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
 			 struct sbi_ecall_return *out);
+void s31_dcache_writeback_all(void);
 void s31_clic_local_init(void);
 void s31_clic_delegate_runtime_sources(void);
 void s31_console_init(void);
 void s31_pma_init(void);
 void s31_release_hart1(void);
 int s31_services_register(void);
+void s31_system_suspend_register(void);
 int s31_timer_init(void);
 
 #endif

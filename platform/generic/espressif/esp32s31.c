@@ -18,6 +18,7 @@
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_scratch.h>
+#include <sbi/sbi_system.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 
 #include "esp32s31/platform.h"
@@ -55,9 +56,19 @@ static int s31_early_init(bool cold_boot)
 	csr_write(S31_CSR_MEXSTATUS, 1);
 
 	if (!cold_boot) {
-		s31_clic_local_init();
+		/*
+		 * A system-suspend warmboot resumes the Linux-owned CLIC and
+		 * interrupt-matrix state.  Resetting all slots here discards active
+		 * S-mode routes immediately before Linux restores SIE.  Hart start
+		 * and hotplug still require the normal per-hart reset path.
+		 */
+		if (!sbi_system_is_suspended())
+			s31_clic_local_init();
 		return 0;
 	}
+
+	/* The generic SUSP ecall probes its backend during extensions_init. */
+	s31_system_suspend_register();
 
 	/* Generic OpenSBI fixups use a private writable copy.  Keep the original
 	 * PSRAM DTB untouched for the S-mode U-Boot handoff. */

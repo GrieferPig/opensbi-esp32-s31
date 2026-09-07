@@ -364,7 +364,27 @@ _wait_for_boot_hart:
 	div	t2, t2, zero
 	div	t2, t2, zero
 	bne	t0, t1, _wait_for_boot_hart
+	j	_start_warm
+	/* S31 stores the light-sleep wake stub in LP_SYS_STORE8[31:2]. */
+	.balign 4
+	.globl s31_retention_warmboot
+s31_retention_warmboot:
+	/* Restore OpenSBI RW/BSS plus both 4 KiB hart scratch/stack areas from
+	 * the LP retention SRAM before generic warmboot reads any state. */
+	li	t0, 0x2e002000
+	lla	t1, _fw_rw_start
+	li	t2, 0x5000
+1:
+	lw	t3, 0(t0)
+	sw	t3, 0(t1)
+	addi	t0, t0, 4
+	addi	t1, t1, 4
+	addi	t2, t2, -4
+	bnez	t2, 1b
+	fence	rw, rw
+	j	_start_warm
 
+	.balign 4
 _start_warm:
 	/* Reset all registers except ra, a0, a1, a2, a3 and a4 for non-boot HART */
 	li	ra, 0

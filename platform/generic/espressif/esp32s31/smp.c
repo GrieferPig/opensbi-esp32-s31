@@ -10,8 +10,6 @@
 #define S31_HP_CORE1_CLIC_CLK_EN	BIT(0)
 #define S31_HP_CORE1_CPU_CLK_EN		BIT(1)
 #define S31_HP_CORE1_GLOBAL_RST_EN	BIT(2)
-#define S31_LP_CORE1_RESET_CTRL		0x20701040UL
-#define S31_LP_CORE1_SW_RESET		BIT(20)
 #define S31_PMU_CPU_STALL_SW		0x207041ecUL
 #define S31_PMU_CORE1_STALL_SHIFT	16
 #define S31_PMU_CORE1_STALL_MASK	(0xffUL << S31_PMU_CORE1_STALL_SHIFT)
@@ -52,22 +50,11 @@ void s31_release_hart1(void)
 	typedef void (*set_boot_addr_t)(u32 addr);
 	u32 val;
 
+	/* Match ESP-IDF start_other_core(): the secondary ROM waits for the
+	 * appcpu boot address after global reset is released. */
 	val = readl((void *)S31_CACHE_L1_ICACHE_CTRL);
 	writel(val & ~S31_CACHE_L1_ICACHE_SHUT_IBUS1,
 	       (void *)S31_CACHE_L1_ICACHE_CTRL);
-	val = readl((void *)S31_PMU_CPU_STALL_SW);
-	val = (val & ~S31_PMU_CORE1_STALL_MASK) |
-	      (0x86UL << S31_PMU_CORE1_STALL_SHIFT);
-	writel(val, (void *)S31_PMU_CPU_STALL_SW);
-	val = readl((void *)S31_HP_CORE1_CTRL);
-	val |= S31_HP_CORE1_CLIC_CLK_EN | S31_HP_CORE1_CPU_CLK_EN;
-	val &= ~S31_HP_CORE1_GLOBAL_RST_EN;
-	writel(val, (void *)S31_HP_CORE1_CTRL);
-	((set_boot_addr_t)S31_ROM_SET_APPCPU_BOOT_ADDR)(
-		(u32)(unsigned long)s31_hart1_entry);
-	RISCV_FENCE(iorw, iorw);
-	writel(readl((void *)S31_LP_CORE1_RESET_CTRL) |
-	       S31_LP_CORE1_SW_RESET, (void *)S31_LP_CORE1_RESET_CTRL);
 	val = readl((void *)S31_PMU_CPU_STALL_SW);
 	val = (val & ~S31_PMU_CORE1_STALL_MASK) |
 	      (0xffUL << S31_PMU_CORE1_STALL_SHIFT);
@@ -75,4 +62,13 @@ void s31_release_hart1(void)
 	RISCV_FENCE(iorw, iorw);
 	while (readl((void *)S31_HP_CORESTALLED_ST) & S31_HP_CORE1_STALLED)
 		;
+
+	val = readl((void *)S31_HP_CORE1_CTRL);
+	val |= S31_HP_CORE1_CLIC_CLK_EN | S31_HP_CORE1_CPU_CLK_EN;
+	val &= ~S31_HP_CORE1_GLOBAL_RST_EN;
+	writel(val, (void *)S31_HP_CORE1_CTRL);
+	RISCV_FENCE(iorw, iorw);
+	((set_boot_addr_t)S31_ROM_SET_APPCPU_BOOT_ADDR)(
+		(u32)(unsigned long)s31_hart1_entry);
+	RISCV_FENCE(iorw, iorw);
 }

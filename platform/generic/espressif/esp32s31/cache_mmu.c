@@ -49,6 +49,12 @@ static void s31_cache_range(unsigned long rom_address, u32 map,
 	((s31_rom_cache_range_t)rom_address)(map, address, size);
 }
 
+void s31_dcache_writeback_all(void)
+{
+	((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
+		S31_CACHE_MAP_DCACHE);
+}
+
 int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
 			 struct sbi_ecall_return *out)
 {
@@ -94,8 +100,7 @@ int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
 				S31_CACHE_MAP_ICACHE, address, size);
 		break;
 	case S31_SBI_DCACHE_WBACK_ALL:
-		((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
-			S31_CACHE_MAP_DCACHE);
+		s31_dcache_writeback_all();
 		break;
 	default:
 		return SBI_ENOTSUPP;
