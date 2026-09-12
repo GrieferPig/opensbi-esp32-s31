@@ -4,7 +4,6 @@
 #include <sbi/sbi_console.h>
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_io.h>
-#include <sbi/sbi_ipi.h>
 #include <sbi/sbi_scratch.h>
 #include <sbi/sbi_string.h>
 #include <sbi/sbi_system.h>
@@ -13,10 +12,21 @@
 
 #define S31_ROM_FLASH_WRITE		0x2f800168UL
 #define S31_ROM_FLASH_ERASE		0x2f800174UL
+#define S31_ROM_CACHE_WRITEBACK_ALL	0x2f800600UL
+#define S31_ROM_ICACHE0_SUSPEND		0x2f800694UL
+#define S31_ROM_ICACHE0_RESUME		0x2f800698UL
+#define S31_ROM_ICACHE1_SUSPEND		0x2f8006a4UL
+#define S31_ROM_ICACHE1_RESUME		0x2f8006a8UL
+#define S31_ROM_DCACHE_SUSPEND		0x2f8006b4UL
+#define S31_ROM_DCACHE_RESUME		0x2f8006b8UL
 #define S31_ROM_SOFTWARE_RESET_SYSTEM	0x2f800094UL
 #define S31_SBI_EXT_FLASH		0x09000000UL
 #define S31_SBI_FLASH_WRITE		0
 #define S31_SBI_FLASH_ERASE		1
+#define S31_SBI_FLASH_PREPARE		2
+#define S31_SBI_FLASH_PARK		3
+#define S31_SBI_FLASH_PARK_STATUS	4
+#define S31_SBI_FLASH_RELEASE		5
 #define S31_SBI_EXT_COPROC		0x09000002UL
 #define S31_SBI_COPROC_SWITCH		0
 #define S31_SBI_COPROC_SAVE		1
@@ -87,7 +97,7 @@
 #define S31_DEEP_SLEEP_MAGIC		0x53314453U
 #define S31_LP_SLEEP_CONTROL		0x2e007c00UL
 #define S31_LP_SLEEP_MAGIC		0x5331504dU
-#define S31_LP_SLEEP_ABI_VERSION	2U
+#define S31_LP_SLEEP_ABI_VERSION	1U
 #define S31_LP_SLEEP_F_MEM		BIT(2)
 #define S31_LP_SLEEP_F_DEEP_REBOOT	BIT(3)
 #define S31_LP_SLEEP_F_GPIO_PULL_UP	BIT(4)
@@ -172,6 +182,7 @@
 #define S31_PMU_SW_INT			BIT(29)
 #define S31_PMU_LP_CORE_WAKEUP		BIT(0)
 #define S31_PMU_RTC_TIMER_WAKEUP	BIT(13)
+#define S31_PMU_LP_GPIO_WAKEUP		BIT(9)
 #define S31_PMU_LP_TIMER1_WAKEUP	BIT(18)
 #define S31_RTC_TIMER_TAR0_LO		0x20800000UL
 #define S31_RTC_TIMER_TAR0_HI		0x20800004UL
@@ -283,6 +294,9 @@ typedef void (*s31_rom_software_reset_system_t)(void);
 typedef int (*s31_rom_flash_write_t)(u32 address, const u32 *buffer,
 				     s32 length);
 typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
+typedef int (*s31_rom_cache_writeback_all_t)(u32 map);
+typedef u32 (*s31_rom_cache_suspend_t)(void);
+typedef void (*s31_rom_cache_resume_t)(u32 autoload);
 
 /*
  * The legacy ROM SPIWrite/SPIEraseArea implementation is not compatible with
@@ -305,6 +319,119 @@ typedef int (*s31_rom_flash_erase_t)(u32 address, u32 length);
 
 static u32 s31_flash_buffer[8];
 
+#define S31_CSR_MHCR 0x7c1
+#define S31_BRANCH_PREDICTOR_MASK (BIT(4) | BIT(5) | BIT(12))
+
+/* The predictor can issue Flash fetches even while running SRAM code. */
+static inline __attribute__((always_inline)) u32 s31_flash_prediction_suspend(void)
+{
+	u32 saved = csr_read_clear(S31_CSR_MHCR, S31_BRANCH_PREDICTOR_MASK);
+	__asm__ __volatile__("fence.i" ::: "memory");
+	return saved & S31_BRANCH_PREDICTOR_MASK;
+}
+
+static inline __attribute__((always_inline)) void s31_flash_prediction_resume(u32 saved)
+{
+	__asm__ __volatile__("fence.i" ::: "memory");
+	csr_set(S31_CSR_MHCR, saved);
+}
+
+
+/* These words and the polling code are in uncached internal SRAM. Parking
+ * in an XIP/PSRAM AMO loop can leave an external-cache transaction in flight
+ * when the PMU stops that CPU, preventing cache maintenance from completing.
+ */
+struct s31_flash_peer_state {
+	volatile u32 prepared;
+	volatile u32 entered;
+	volatile u32 release;
+	volatile u32 exited;
+};
+static struct s31_flash_peer_state s31_flash_peers[2];
+
+static int __attribute__((section(".data.s31_flash_text"), noinline))
+s31_flash_peer_park(u32 hart)
+{
+	struct s31_flash_peer_state *state = &s31_flash_peers[hart];
+	u32 predictor;
+
+	if (!state->prepared)
+		return SBI_ERR_INVALID_PARAM;
+	predictor = s31_flash_prediction_suspend();
+	state->entered = 1;
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	while (!state->release)
+		__asm__ __volatile__("nop" ::: "memory");
+	s31_flash_prediction_resume(predictor);
+	state->exited = 1;
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	return SBI_SUCCESS;
+}
+
+static void __attribute__((section(".data.s31_flash_text"), noinline))
+s31_flash_peer_release(u32 peer, u32 queued)
+{
+	struct s31_flash_peer_state *state = &s31_flash_peers[peer];
+
+	state->release = 1;
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	if (!queued) {
+		/* The Linux queue call failed: no callback can arrive later. */
+		state->exited = 1;
+	} else if (state->entered) {
+		while (!state->exited)
+			__asm__ __volatile__("nop" ::: "memory");
+	}
+	/* A cancelled callback which has not entered yet observes release=1
+	 * and exits immediately. PREPARE refuses reuse until that exit, and
+	 * the callback carries no pointer into its caller's stack.
+	 */
+}
+
+static int s31_flash_peer_control(unsigned long funcid,
+				  struct sbi_trap_regs *regs,
+				  struct sbi_ecall_return *out)
+{
+	u32 hart = current_hartid();
+	u32 peer = regs->a0;
+	struct s31_flash_peer_state *state;
+	int ret;
+
+	if (hart > 1)
+		return SBI_ERR_INVALID_PARAM;
+	if (funcid == S31_SBI_FLASH_PARK) {
+		ret = s31_flash_peer_park(hart);
+		out->value = 0;
+		return ret;
+	}
+	if (peer > 1 || peer == hart)
+		return SBI_ERR_INVALID_PARAM;
+	state = &s31_flash_peers[peer];
+	switch (funcid) {
+	case S31_SBI_FLASH_PREPARE:
+		if (state->prepared && !state->exited)
+			return SBI_ERR_ALREADY_AVAILABLE;
+		state->entered = 0;
+		state->release = 0;
+		state->exited = 0;
+		state->prepared = 1;
+		__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+		out->value = 0;
+		return SBI_SUCCESS;
+	case S31_SBI_FLASH_PARK_STATUS:
+		out->value = state->entered | (state->exited << 1);
+		return SBI_SUCCESS;
+	case S31_SBI_FLASH_RELEASE:
+		if (regs->a1 > 1)
+			return SBI_ERR_INVALID_PARAM;
+		s31_flash_peer_release(peer, regs->a1);
+		out->value = 0;
+		return SBI_SUCCESS;
+	default:
+		return SBI_ERR_NOT_SUPPORTED;
+	}
+}
+
 static inline u32 s31_flash_rdcycle(void)
 {
 	u32 value;
@@ -325,29 +452,38 @@ s31_flash_rom_operation(u32 funcid, u32 address, const u32 *buffer, u32 length)
 	u32 stall_bit = BIT(peer);
 	u32 saved_stall_ctrl = *stall_ctrl;
 	u32 saved_sus_ctrl = *sus_ctrl;
-	u32 start;
+	u32 start, icache0, icache1, dcache, predictor;
 	int ret;
 
+	predictor = s31_flash_prediction_suspend();
 	*stall_ctrl = (saved_stall_ctrl & ~stall_mask) |
 		(S31_PMU_STALL_CODE << stall_shift);
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
-	/*
-	 * A hart which is already in WFI does not observe the PMU software-stall
-	 * request until it wakes.  Flash writes from JFFS2 commonly arrive while
-	 * the other CPU is idle, so kick its M-mode IPI source after arming the
-	 * stall.  The pending stall then catches the peer before any XIP mapping is
-	 * changed by the ROM operation.
+	/* PREPARE/PARK has already confirmed an IRQ-disabled peer executing
+	 * in SRAM. It cannot be asleep in WFI and needs no machine IPI kick.
 	 */
-	sbi_ipi_raw_send(sbi_hartid_to_hartindex(peer), false);
 	start = s31_flash_rdcycle();
 	while (!(*stall_status & stall_bit)) {
 		if ((u32)(s31_flash_rdcycle() - start) >
 		    S31_PMU_STALL_TIMEOUT_CYCLES) {
 			*stall_ctrl = saved_stall_ctrl;
+			s31_flash_prediction_resume(predictor);
 			return 2;
 		}
 	}
 
+	/* Stalling the CPUs does not stop cache autoload or outstanding SPI0
+	 * reads. Quiesce the external cache before using the legacy SPI1 ROM
+	 * writer with auto-suspend disabled. The complete guard, including its
+	 * stack and write buffer, lives in SRAM. Preserve dirty PSRAM first:
+	 * suspending D-cache invalidates its tags.
+	 */
+	ret = ((s31_rom_cache_writeback_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(BIT(4));
+	if (ret)
+		goto unstall;
+	icache0 = ((s31_rom_cache_suspend_t)S31_ROM_ICACHE0_SUSPEND)();
+	icache1 = ((s31_rom_cache_suspend_t)S31_ROM_ICACHE1_SUSPEND)();
+	dcache = ((s31_rom_cache_suspend_t)S31_ROM_DCACHE_SUSPEND)();
 	*sus_ctrl = saved_sus_ctrl &
 		~(S31_SPI1_AUTO_RESUME_EN | S31_SPI1_AUTO_SUSPEND_EN);
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
@@ -360,10 +496,16 @@ s31_flash_rom_operation(u32 funcid, u32 address, const u32 *buffer, u32 length)
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
 	*sus_ctrl = saved_sus_ctrl;
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+	((s31_rom_cache_resume_t)S31_ROM_DCACHE_RESUME)(dcache);
+	((s31_rom_cache_resume_t)S31_ROM_ICACHE0_RESUME)(icache0);
+	((s31_rom_cache_resume_t)S31_ROM_ICACHE1_RESUME)(icache1);
+	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
+unstall:
 	*stall_ctrl = saved_stall_ctrl;
 	__asm__ __volatile__("fence iorw, iorw" ::: "memory");
 	while (*stall_status & stall_bit)
 		;
+	s31_flash_prediction_resume(predictor);
 	return ret;
 }
 
@@ -375,6 +517,12 @@ static int s31_flash_ecall(unsigned long extid, unsigned long funcid,
 	u32 length = regs->a2;
 	int ret;
 
+	if (funcid >= S31_SBI_FLASH_PREPARE)
+		return s31_flash_peer_control(funcid, regs, out);
+	/* A matched Linux driver must first park the other hart in SRAM. */
+	if (!s31_flash_peers[current_hartid() ^ 1U].entered ||
+	    s31_flash_peers[current_hartid() ^ 1U].exited)
+		return SBI_ERR_DENIED;
 	if (!length || address >= S31_FLASH_SIZE ||
 	    length > S31_FLASH_SIZE - address)
 		return SBI_ERR_INVALID_PARAM;
@@ -560,6 +708,9 @@ static struct sbi_ecall_extension s31_clic_ecall_ext = {
 	.handle = s31_clic_ecall,
 };
 
+static u32 s31_suspend_appwr_pwr;
+static u32 s31_suspend_appwr_clk;
+
 /* The generic OpenSBI SUSP core stops secondary harts and saves the
  * non-retentive warmboot state before entering this callback. */
 static int s31_system_suspend_check(u32 sleep_type)
@@ -574,8 +725,6 @@ static int s31_system_suspend(u32 sleep_type,
 	volatile u32 *control = (volatile u32 *)S31_LP_SLEEP_CONTROL;
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	void *runtime_rw = (void *)(scratch->fw_start + scratch->fw_rw_offset);
-	u32 saved_appwr_pwr;
-	u32 saved_appwr_clk;
 	u32 start;
 
 	if (control[0] != S31_LP_SLEEP_MAGIC ||
@@ -661,13 +810,22 @@ static int s31_system_suspend(u32 sleep_type,
 		       (void *)S31_RTC_TIMER_TAR0_LO);
 	writel_relaxed((readl_relaxed((void *)S31_RTC_TIMER_TAR1_HI) & 0xffffU) |
 		       S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
-	writel_relaxed(S31_PMU_RTC_TIMER_WAKEUP,
+	writel_relaxed(S31_PMU_RTC_TIMER_WAKEUP |
+		       ((control[5] & S31_LP_WAKE_GPIO) ?
+			S31_PMU_LP_GPIO_WAKEUP : 0),
 		       (void *)S31_PMU_WAKE_CNTL2);
 	RISCV_FENCE(iorw, iorw);
 	/* HSM state, system_suspended and scratch resume metadata were updated by
 	 * the generic SBI layer immediately before this callback.  S31's D-cache
 	 * is not snooped by the HP-SRAM backing store, and the cache contents are
 	 * lost across the PMU CPU reset, so commit all of it before sleep. */
+	/* A successful APPWR transition resumes through the retained warmboot
+	 * vector rather than returning to this stack frame.  Save the active
+	 * profile in OpenSBI's retained RW image for system_resume(). */
+	s31_suspend_appwr_pwr =
+		readl_relaxed((void *)S31_LP_PWR_APPWR_PWR_CFG);
+	s31_suspend_appwr_clk =
+		readl_relaxed((void *)S31_LP_PWR_APPWR_CLK_CFG);
 	s31_dcache_writeback_all();
 	RISCV_FENCE(rw, rw);
 	sbi_memcpy((void *)S31_OPENSBI_RETENTION_BUFFER, runtime_rw,
@@ -679,8 +837,6 @@ static int s31_system_suspend(u32 sleep_type,
 	 * islands, while mode 2 retains the four HP memory banks.  Save the boot
 	 * profile so non-suspend users continue to observe the firmware defaults.
 	 * The LP timer ISR pairs this request with APPWR_WAKEUP_REQ. */
-	saved_appwr_pwr = readl_relaxed((void *)S31_LP_PWR_APPWR_PWR_CFG);
-	saved_appwr_clk = readl_relaxed((void *)S31_LP_PWR_APPWR_CLK_CFG);
 	writel_relaxed(S31_LP_PWR_APPWR_RET_PWR_CFG,
 		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
 	writel_relaxed(S31_LP_PWR_APPWR_RET_CLK_CFG,
@@ -703,8 +859,10 @@ static int s31_system_suspend(u32 sleep_type,
 			return SBI_ERR_TIMEOUT;
 		}
 	}
-	writel_relaxed(saved_appwr_pwr, (void *)S31_LP_PWR_APPWR_PWR_CFG);
-	writel_relaxed(saved_appwr_clk, (void *)S31_LP_PWR_APPWR_CLK_CFG);
+	writel_relaxed(s31_suspend_appwr_pwr,
+		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
+	writel_relaxed(s31_suspend_appwr_clk,
+		       (void *)S31_LP_PWR_APPWR_CLK_CFG);
 	RISCV_FENCE(iorw, iorw);
 	if (readl_relaxed((void *)S31_PMU_INT_RAW) & S31_PMU_SLEEP_REJECT) {
 		sbi_printf("S31 SUSP: PMU rejected sleep raw=%x\n",
@@ -728,6 +886,11 @@ static int s31_system_suspend(u32 sleep_type,
 
 static void s31_system_resume(void)
 {
+	writel_relaxed(s31_suspend_appwr_pwr,
+		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
+	writel_relaxed(s31_suspend_appwr_clk,
+		       (void *)S31_LP_PWR_APPWR_CLK_CFG);
+	RISCV_FENCE(iorw, iorw);
 	writel_relaxed(0, (void *)S31_LP_SYS_STORE8);
 }
 

@@ -20,6 +20,7 @@ typedef int (*s31_rom_cache_all_t)(u32 map);
 #define S31_ROM_CACHE_WRITEBACK_ALL	0x2f800600UL
 #define S31_CACHE_MAP_ICACHE		(BIT(0) | BIT(1))
 #define S31_CACHE_MAP_DCACHE		BIT(4)
+#define S31_CACHE_LINE_SIZE		64U
 
 #define S31_SBI_CACHE_WBACK		0
 #define S31_SBI_CACHE_INVAL		1
@@ -43,10 +44,10 @@ static bool s31_cache_range_valid(u32 address, u32 size)
 	return false;
 }
 
-static void s31_cache_range(unsigned long rom_address, u32 map,
+static int s31_cache_range(unsigned long rom_address, u32 map,
 			    u32 address, u32 size)
 {
-	((s31_rom_cache_range_t)rom_address)(map, address, size);
+	return ((s31_rom_cache_range_t)rom_address)(map, address, size);
 }
 
 void s31_dcache_writeback_all(void)
@@ -60,6 +61,7 @@ int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
 {
 	u32 address = (u32)regs->a0;
 	u32 size = (u32)regs->a1;
+	int ret = 0;
 
 	switch (funcid) {
 	case S31_SBI_CACHE_WBACK:
@@ -68,44 +70,53 @@ int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
 	case S31_SBI_ICACHE_SYNC_RANGE:
 		if (!s31_cache_range_valid(address, size))
 			return SBI_ERR_INVALID_PARAM;
+		/* Cache maintenance operates on 64-byte lines. Cover every touched
+		 * line even when MTD programs 4..32 bytes within a line. */
+		size = (size + (address & (S31_CACHE_LINE_SIZE - 1)) +
+			S31_CACHE_LINE_SIZE - 1) & ~(S31_CACHE_LINE_SIZE - 1);
+		address &= ~(S31_CACHE_LINE_SIZE - 1);
 		break;
 	}
 
 	switch (funcid) {
 	case S31_SBI_CACHE_WBACK:
-		s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+		ret = s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
 				S31_CACHE_MAP_DCACHE, address, size);
 		break;
 	case S31_SBI_CACHE_INVAL:
-		s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+		ret = s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
 				S31_CACHE_MAP_DCACHE, address, size);
 		break;
 	case S31_SBI_CACHE_WBACK_INVAL:
-		s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+		ret = s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
 				S31_CACHE_MAP_DCACHE, address, size);
-		s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
-				S31_CACHE_MAP_DCACHE, address, size);
+		if (!ret)
+			ret = s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+					S31_CACHE_MAP_DCACHE, address, size);
 		break;
 	case S31_SBI_ICACHE_SYNC:
-		((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
+		ret = ((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
 			S31_CACHE_MAP_DCACHE);
-		((s31_rom_cache_all_t)S31_ROM_CACHE_INVALIDATE_ALL)(
-			S31_CACHE_MAP_ICACHE);
+		if (!ret)
+			ret = ((s31_rom_cache_all_t)S31_ROM_CACHE_INVALIDATE_ALL)(
+				S31_CACHE_MAP_ICACHE);
 		break;
 	case S31_SBI_ICACHE_SYNC_RANGE:
 		if (address >= S31_PSRAM_LINUX_START)
-			s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
+			ret = s31_cache_range(S31_ROM_CACHE_WRITEBACK_ADDR,
 					S31_CACHE_MAP_DCACHE, address, size);
-		s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
-				S31_CACHE_MAP_ICACHE, address, size);
+		if (!ret)
+			ret = s31_cache_range(S31_ROM_CACHE_INVALIDATE_ADDR,
+					S31_CACHE_MAP_ICACHE, address, size);
 		break;
 	case S31_SBI_DCACHE_WBACK_ALL:
-		s31_dcache_writeback_all();
+		ret = ((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
+			S31_CACHE_MAP_DCACHE);
 		break;
 	default:
 		return SBI_ENOTSUPP;
 	}
 
-	out->value = 0;
-	return 0;
+	out->value = ret;
+	return ret ? SBI_ERR_FAILED : SBI_SUCCESS;
 }
