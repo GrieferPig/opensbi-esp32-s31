@@ -680,6 +680,14 @@ static int s31_clic_ecall(unsigned long extid, unsigned long funcid,
 	case S31_SBI_CLIC_MIE:
 		out->value = csr_read(CSR_MIE);
 		break;
+	case 6: {
+		/* Complete SRAM footprint, including runtime stacks and heap.
+		 * Linux radio must exclude this from its reclaimed low SRAM. */
+		struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
+
+		out->value = scratch->fw_start + scratch->fw_size;
+		break;
+	}
 	case S31_SBI_CLIC_WFI:
 		/*
 		 * A private M-level timer-group comparator bounds each hart's WFI. The
