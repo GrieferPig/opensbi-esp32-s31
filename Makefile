@@ -450,11 +450,9 @@ MERGEFLAGS	+=	-m elf$(PLATFORM_RISCV_XLEN)lriscv
 DTSCPPFLAGS	=	$(CPPFLAGS) -nostdinc -nostdlib -fno-builtin -D__DTS__ -x assembler-with-cpp
 
 ifneq ($(DEBUG),)
-CFLAGS		+=	-O0
 CPPFLAGS	+=	-DOPENSBI_DEBUG
-else
-CFLAGS		+=	-O2
 endif
+CFLAGS		+=	-Os
 
 ifeq ($(UBSAN),y)
 UBSAN_CC_FLAGS := -fsanitize=undefined
