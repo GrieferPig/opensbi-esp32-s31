@@ -8,11 +8,11 @@
  *   Anup Patel <anup.patel@wdc.com>
  */
 
-	ASSERT(FW_TEXT_START == 0x40220000 || FW_TEXT_START == 0x40000400 ||
+	ASSERT(FW_TEXT_START == 0x40220000 || FW_TEXT_START == 0x4000e400 ||
 	       FW_TEXT_START == 0x2F000000,
 		"FW_TEXT_START must be a supported ESP32-S31 XIP/SPL load base")
 	ASSERT((FW_TEXT_START == 0x40220000 && FW_RW_START == 0x50FF0000) ||
-	       (FW_TEXT_START == 0x40000400 && FW_RW_START == 0x2F00F000) ||
+	       (FW_TEXT_START == 0x4000e400 && FW_RW_START == 0x2F00F000) ||
 	       (FW_TEXT_START == 0x2F000000 && FW_RW_START == 0x2F021000),
 		"FW_RW_START must match the selected ESP32-S31 boot layout")
 
@@ -21,7 +21,13 @@
 	/* Don't add any section between FW_TEXT_START and _fw_start */
 	PROVIDE(_fw_start = .);
 
+#if FW_TEXT_START == 0x4000e400
+	/* The S31 FIT places the raw binary at this 64-byte-aligned base.
+	 * objcopy omits a gap before the first loadable section, so aligning
+	 * .text upward silently relocates PC-relative SRAM addresses. */
+#else
 	. = ALIGN(0x1000); /* Need this to create proper sections */
+#endif
 
 	/* Beginning of the code section */
 
@@ -34,6 +40,8 @@
 		. = ALIGN(8);
 		PROVIDE(_text_end = .);
 	}
+	ASSERT(_start == FW_TEXT_START,
+	       "ESP32-S31 raw firmware entry must equal its FIT load address")
 
 	/* End of the code sections */
 
