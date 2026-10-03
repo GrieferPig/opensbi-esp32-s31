@@ -7,6 +7,9 @@
 #include <sbi/sbi_trap.h>
 #include <sbi/sbi_types.h>
 
+/* SPL installs one linear map: XIP address = raw NOR offset + START.
+ * Retain it across boot and suspend; all 16 MiB are mapped without aliases.
+ */
 #define S31_FLASH_SIZE		0x01000000UL
 #define S31_FLASH_XIP_START	0x40000000UL
 #define S31_PSRAM_LINUX_START	0x50000000UL
