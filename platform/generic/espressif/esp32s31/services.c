@@ -336,7 +336,6 @@ static inline __attribute__((always_inline)) void s31_flash_prediction_resume(u3
 	csr_set(S31_CSR_MHCR, saved);
 }
 
-
 /* These words and the polling code are in uncached internal SRAM. Parking
  * in an XIP/PSRAM AMO loop can leave an external-cache transaction in flight
  * when the PMU stops that CPU, preventing cache maintenance from completing.
@@ -727,14 +726,82 @@ static int s31_system_suspend_check(u32 sleep_type)
 		SBI_SUCCESS : SBI_ERR_NOT_SUPPORTED;
 }
 
+/* Every instruction between APPWR sleep request and active-profile restore
+ * must remain in retained SRAM: TOP/connection clocks may disappear before
+ * the next XIP fetch. No printf, cache call or other flash callee is legal
+ * in this interval. A reset wake uses the retained warmboot vector. */
+static int __attribute__((section(".data.s31_flash_text"), noinline))
+s31_suspend_request_wait(volatile u32 *control, int result)
+{
+	u32 start, raw;
+
+	if (result || control[19] != S31_LP_SLEEP_HP_ASLEEP) {
+		if (!result)
+			result = SBI_ERR_FAILED;
+		goto restore;
+	}
+	writel_relaxed(S31_LP_PWR_APPWR_SLEEP_REQ,
+		       (void *)S31_LP_PWR_APPWR_CTRL);
+	RISCV_FENCE(iorw, iorw);
+	start = csr_read(CSR_CYCLE);
+	while (!(readl_relaxed((void *)S31_PMU_INT_RAW) &
+		 (S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT)) &&
+	       control[19] != S31_LP_SLEEP_WAKING) {
+		if ((u32)(csr_read(CSR_CYCLE) - start) > S31_LP_WAIT_CYCLES) {
+			result = SBI_ERR_TIMEOUT;
+			break;
+		}
+	}
+restore:
+	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_TAR0_HI) &
+		       ~S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
+	writel_relaxed(s31_suspend_appwr_pwr,
+		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
+	writel_relaxed(s31_suspend_appwr_clk,
+		       (void *)S31_LP_PWR_APPWR_CLK_CFG);
+	RISCV_FENCE(iorw, iorw);
+	raw = readl_relaxed((void *)S31_PMU_INT_RAW);
+	if (raw & S31_PMU_SLEEP_REJECT)
+		result = SBI_ERR_FAILED;
+	writel_relaxed(S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT,
+		       (void *)S31_PMU_INT_CLR);
+	return result;
+}
+
+/* The LP response CRC is published after programming target1 and enabling
+ * its interrupt. TAR_EN is a write trigger, not a readable enable latch.
+ * ARM has completed before entry, so only the MEM timer commit (or wake)
+ * can replace that response. Require a new, stable, valid response before
+ * consuming the target registers. A checksum collision fails closed. */
+static bool s31_suspend_timer_committed(volatile u32 *control, u32 armed_crc)
+{
+	volatile u8 *bytes = (volatile u8 *)control;
+	u32 response = control[27], crc = ~0U;
+	unsigned int i, bit;
+
+	if (response == armed_crc)
+		return false;
+	RISCV_FENCE(rw, rw);
+	for (i = 0; i < 27U * sizeof(u32); i++) {
+		crc ^= bytes[i];
+		for (bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+	}
+	RISCV_FENCE(rw, rw);
+	return response == control[27] && response == ~crc &&
+		control[19] == S31_LP_SLEEP_HP_ASLEEP;
+}
+
 static int s31_system_suspend(u32 sleep_type,
 			      unsigned long mmode_resume_addr)
 {
 	volatile u32 *control = (volatile u32 *)S31_LP_SLEEP_CONTROL;
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	void *runtime_rw = (void *)(scratch->fw_start + scratch->fw_rw_offset);
-	u32 start;
+	int result;
+	u32 start, armed_crc;
 
+	sbi_printf("S31 SUSP: backend entry state=%u\n", control[19]);
 	if (control[0] != S31_LP_SLEEP_MAGIC ||
 	    control[1] != S31_LP_SLEEP_ABI_VERSION ||
 	    control[2] < 28U * sizeof(u32) ||
@@ -806,18 +873,8 @@ static int s31_system_suspend(u32 sleep_type,
 		       S31_PMU_HP_ACTIVE2SLEEP_BACKUP_EN,
 		       (void *)S31_PMU_HP_SLEEP_BACKUP);
 	writel_relaxed(0, (void *)S31_PMU_WAKE_CNTL1);
-	/*
-	 * The LP firmware owns duration conversion and arms RTC target 1 for its
-	 * ISR.  Mirror that absolute deadline to target 0, which is the PMU's
-	 * always-on system timer wake source used by the IDF sleep path.  This
-	 * remains effective even if entering HP sleep also stalls the LP core.
-	 */
-	writel_relaxed(S31_RTC_TIMER_SOC_WAKE_CLR,
-		       (void *)S31_RTC_TIMER_INT_CLR);
-	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_TAR1_LO),
-		       (void *)S31_RTC_TIMER_TAR0_LO);
-	writel_relaxed((readl_relaxed((void *)S31_RTC_TIMER_TAR1_HI) & 0xffffU) |
-		       S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
+	/* The retained helper waits for LP target1 arming before installing
+	 * target0 and requesting power gating. */
 	writel_relaxed(S31_PMU_RTC_TIMER_WAKEUP |
 		       ((control[5] & S31_LP_WAKE_GPIO) ?
 			S31_PMU_LP_GPIO_WAKEUP : 0),
@@ -834,8 +891,10 @@ static int s31_system_suspend(u32 sleep_type,
 		readl_relaxed((void *)S31_LP_PWR_APPWR_PWR_CFG);
 	s31_suspend_appwr_clk =
 		readl_relaxed((void *)S31_LP_PWR_APPWR_CLK_CFG);
+
 	s31_dcache_writeback_all();
 	RISCV_FENCE(rw, rw);
+
 	sbi_memcpy((void *)S31_OPENSBI_RETENTION_BUFFER, runtime_rw,
 		   S31_OPENSBI_RETENTION_SIZE);
 	RISCV_FENCE(rw, rw);
@@ -849,36 +908,42 @@ static int s31_system_suspend(u32 sleep_type,
 		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
 	writel_relaxed(S31_LP_PWR_APPWR_RET_CLK_CFG,
 		       (void *)S31_LP_PWR_APPWR_CLK_CFG);
-	/* LP GPIO polling becomes a real wake source only after this point. */
+
+	result = SBI_SUCCESS;
+	armed_crc = control[27];
 	control[19] = S31_LP_SLEEP_HP_ASLEEP;
 	RISCV_FENCE(rw, rw);
-	writel_relaxed(S31_LP_PWR_APPWR_SLEEP_REQ,
-		       (void *)S31_LP_PWR_APPWR_CTRL);
-	RISCV_FENCE(iorw, iorw);
-
+	/* MEM ARM defers target1 until HP_ASLEEP. Wait for the LP firmware's
+	 * completed response before mirroring the freshly programmed deadline. */
 	start = csr_read(CSR_CYCLE);
-	while (!(readl_relaxed((void *)S31_PMU_INT_RAW) &
-		 (S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT)) &&
-	       control[19] != S31_LP_SLEEP_WAKING) {
-		if ((u32)(csr_read(CSR_CYCLE) - start) > S31_LP_WAIT_CYCLES) {
-			sbi_printf("S31 SUSP: PMU timeout state=%x raw=%x\n",
-				   control[19],
-				   readl_relaxed((void *)S31_PMU_INT_RAW));
-			return SBI_ERR_TIMEOUT;
+	while (!s31_suspend_timer_committed(control, armed_crc)) {
+		if (control[19] != S31_LP_SLEEP_HP_ASLEEP ||
+		    (u32)(csr_read(CSR_CYCLE) - start) > S31_LP_WAIT_CYCLES) {
+			result = SBI_ERR_TIMEOUT;
+			goto request;
 		}
 	}
-	writel_relaxed(s31_suspend_appwr_pwr,
-		       (void *)S31_LP_PWR_APPWR_PWR_CFG);
-	writel_relaxed(s31_suspend_appwr_clk,
-		       (void *)S31_LP_PWR_APPWR_CLK_CFG);
+	/* Mirror only the freshly armed LP deadline, never the stale target
+	 * value present during the earlier Linux device suspend phase. */
+	writel_relaxed(S31_RTC_TIMER_SOC_WAKE_CLR,
+		       (void *)S31_RTC_TIMER_INT_CLR);
+	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_TAR1_LO),
+		       (void *)S31_RTC_TIMER_TAR0_LO);
+	writel_relaxed((readl_relaxed((void *)S31_RTC_TIMER_TAR1_HI) & 0xffffU) |
+		       S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
 	RISCV_FENCE(iorw, iorw);
-	if (readl_relaxed((void *)S31_PMU_INT_RAW) & S31_PMU_SLEEP_REJECT) {
-		sbi_printf("S31 SUSP: PMU rejected sleep raw=%x\n",
-			   readl_relaxed((void *)S31_PMU_INT_RAW));
-		return SBI_ERR_FAILED;
+	if (control[19] != S31_LP_SLEEP_HP_ASLEEP) {
+		result = SBI_ERR_FAILED;
+		goto request;
 	}
-	writel_relaxed(S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT,
-		       (void *)S31_PMU_INT_CLR);
+request:
+	result = s31_suspend_request_wait(control, result);
+	if (result) {
+		sbi_printf("S31 SUSP: request failed result=%d state=%u raw=%x\n",
+			   result, control[19],
+			   readl_relaxed((void *)S31_PMU_INT_RAW));
+		return result;
+	}
 
 	(void)sleep_type;
 	(void)mmode_resume_addr;

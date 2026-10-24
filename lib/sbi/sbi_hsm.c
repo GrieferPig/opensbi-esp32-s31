@@ -186,9 +186,9 @@ static void sbi_hsm_hart_wait(struct sbi_scratch *scratch)
 #ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
 		/*
 		 * S31 never unmasks M-mode CLIC ID3.  Poll the HSM state instead;
-		 * the boot hart writes the state and then flushes PSRAM in
-		 * sbi_platform_hsm_start_sync(), so the
-		 * poll loop sees START_PENDING almost immediately.
+		 * the boot hart publishes cached next-context data through
+		 * sbi_platform_hsm_start_sync() before committing START_PENDING.
+		 * The internal-SRAM state word is then the wakeup publication.
 		 */
 		{
 			unsigned long wait = 100000;
@@ -364,6 +364,14 @@ int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 	rscratch->next_addr = saddr;
 	rscratch->next_mode = smode;
 
+	/* Publish cache-backed next-context data before the stopped hart can
+	 * observe START_PENDING and resume. The S31 stopped hart polls an
+	 * internal-SRAM state word, so publishing the state first would let it
+	 * race a global cache writeback. A start ticket excludes another
+	 * initiator; a non-stopped target must not enter this cold sync hook. */
+	if (atomic_read(&hdata->state) == SBI_HSM_STATE_STOPPED)
+		sbi_platform_hsm_start_sync(hartid);
+
 	/*
 	 * atomic_cmpxchg() is an implicit barrier. It makes sure that
 	 * other harts see reading of init_count and writing to *rscratch
@@ -384,12 +392,6 @@ int sbi_hsm_hart_start(struct sbi_scratch *scratch,
 		rc = SBI_EINVAL;
 		goto err;
 	}
-
-	/* Platform hook: flush cached scratch state to PSRAM *after* the
-	 * state transition so the target hart observes both the new next
-	 * context and hdata->state == START_PENDING before the IPI.
-	 */
-	sbi_platform_hsm_start_sync(hartid);
 
 	if ((hsm_device_has_hart_hotplug() && (entry_count == init_count)) ||
 	   (hsm_device_has_hart_secondary_boot() && !init_count)) {

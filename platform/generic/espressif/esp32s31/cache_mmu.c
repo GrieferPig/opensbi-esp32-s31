@@ -8,6 +8,7 @@
  * Modified for dual-hart SMP, direct S-mode timer delivery and XIP OpenSBI.
  */
 #include <sbi/sbi_error.h>
+#include <sbi/riscv_io.h>
 
 #include "platform.h"
 
@@ -54,6 +55,17 @@ void s31_dcache_writeback_all(void)
 {
 	((s31_rom_cache_all_t)S31_ROM_CACHE_WRITEBACK_ALL)(
 		S31_CACHE_MAP_DCACHE);
+}
+
+/* Publish next-context data while the target is still stopped. The
+ * subsequent HSM START_PENDING store is the wakeup commit for the polling
+ * hart. A fence alone does not write dirty data to the backing store.
+ * This is a cold hart-start boundary, never a radio execution-span gate. */
+void sbi_platform_hsm_start_sync(u32 hartid)
+{
+	(void)hartid;
+	s31_dcache_writeback_all();
+	RISCV_FENCE(iorw, iorw);
 }
 
 int s31_cache_vendor_ext(long funcid, struct sbi_trap_regs *regs,
