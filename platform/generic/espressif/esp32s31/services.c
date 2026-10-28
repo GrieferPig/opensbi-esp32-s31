@@ -39,6 +39,7 @@
 #define S31_SBI_CLIC_MIP		2
 #define S31_SBI_CLIC_MIE		3
 #define S31_SBI_CLIC_WFI		4
+#define S31_SBI_CLIC_WFI_GUARD_US	7
 
 #define S31_CSR_MINTSTATUS		0xfb1
 #define S31_CSR_MINTTHRESH		0x347
@@ -90,18 +91,19 @@
 #define S31_IDLE_TIMER_T1_CLK_SRC_MASK	(3U << 6)
 
 #define S31_LP_SYS_STORE8		0x2070004cUL
-#define S31_LP_SYS_STORE2		0x20700034UL
-#define S31_LP_SYS_STORE3		0x20700038UL
-#define S31_LP_SYS_STORE4		0x2070003cUL
-#define S31_LP_SYS_STORE5		0x20700040UL
-#define S31_DEEP_SLEEP_MAGIC		0x53314453U
+/* Wire layout: Linux include/linux/soc/espressif/esp32s31-lp-protocol.h.
+ * Kept here so this OpenSBI repository also builds independently.
+ */
+#define S31_LP_POWEROFF_ADDR		0x2e007d00UL
+#define S31_LP_POWEROFF_MAGIC		0x53314f46U
+#define S31_LP_POWEROFF_VERSION		1U
+#define S31_LP_POWEROFF_RTC		BIT(0)
+#define S31_POWEROFF_WAIT_CYCLES		80000000U /* 2 s at terminal 40 MHz */
 #define S31_LP_SLEEP_CONTROL		0x2e007c00UL
 #define S31_LP_SLEEP_MAGIC		0x5331504dU
-#define S31_LP_SLEEP_ABI_VERSION	1U
+#define S31_LP_SLEEP_ABI_VERSION	2U
 #define S31_LP_SLEEP_F_MEM		BIT(2)
-#define S31_LP_SLEEP_F_DEEP_REBOOT	BIT(3)
-#define S31_LP_SLEEP_F_GPIO_PULL_UP	BIT(4)
-#define S31_LP_SLEEP_F_GPIO_PULL_DOWN	BIT(5)
+#define S31_LP_SLEEP_F_RTC_ABSOLUTE	BIT(6)
 #define S31_LP_WAKE_TIMER		BIT(0)
 #define S31_LP_WAKE_GPIO		BIT(1)
 #define S31_LP_SLEEP_ARMED		3U
@@ -155,12 +157,6 @@
 #define S31_PMU_LP_ACTIVE_REGULATOR1	0x207040c4UL
 #define S31_PMU_LP_ACTIVE_DIG_POWER	0x207040ccUL
 #define S31_PMU_LP_ACTIVE_CLK_POWER	0x207040d0UL
-#define S31_PMU_IMMEDIATE_FIRST		0x207040f0UL
-#define S31_PMU_IMMEDIATE_LAST		0x20704110UL
-#define S31_PMU_IMM_SLEEP_SYSCLK	0x207040f8UL
-#define S31_PMU_IMM_MODEM_ICG		0x20704104UL
-#define S31_PMU_UPDATE_DIG_ICG_SWITCH	BIT(28)
-#define S31_PMU_UPDATE_DIG_ICG_MODEM	BIT(31)
 #define S31_PMU_FORCE_HP_MEM_PU_NOISO	0xff000000U
 #define S31_PMU_HP_MEM012_ON_MASK	0xfffe0000U
 #define S31_PMU_INT_RAW			0x2070418cUL
@@ -183,7 +179,6 @@
 #define S31_PMU_LP_CORE_WAKEUP		BIT(0)
 #define S31_PMU_RTC_TIMER_WAKEUP	BIT(13)
 #define S31_PMU_LP_GPIO_WAKEUP		BIT(9)
-#define S31_PMU_LP_TIMER1_WAKEUP	BIT(18)
 #define S31_RTC_TIMER_TAR0_LO		0x20800000UL
 #define S31_RTC_TIMER_TAR0_HI		0x20800004UL
 #define S31_RTC_TIMER_TAR1_LO		0x20800008UL
@@ -195,12 +190,15 @@
 #define S31_RTC_TIMER_TAR_EN		BIT(31)
 #define S31_RTC_TIMER_UPDATE_NOW	BIT(27)
 #define S31_RTC_TIMER_SOC_WAKE_CLR	BIT(31)
-#define S31_RTC_SLOW_HZ			155386ULL
 #define S31_LP_CLKRST_ROOT_CLK_CONF	0x20701000UL
 #define S31_LP_CLKRST_FAST_CLK_SEL	(3U << 26)
 #define S31_RC_FAST_STABILIZE_CYCLES	16000U
 #define S31_HP_CLKRST_SOC_CLK_SEL	0x20587000UL
 #define S31_HP_CLKRST_CPU_FREQ_CTRL	0x20587004UL
+#define S31_HP_CLKRST_CORE0_CTRL		0x2058701cUL
+#define S31_HP_CORE_CLIC_CLK_EN		BIT(0)
+#define S31_HP_CORE_CPU_CLK_EN		BIT(1)
+#define S31_HP_CORE_GLOBAL_RST_EN	BIT(2)
 #define S31_HP_CLKRST_MEM_FREQ_CTRL	0x20587008UL
 #define S31_HP_CLKRST_SYS_FREQ_CTRL	0x2058700cUL
 #define S31_HP_CLKRST_APB_FREQ_CTRL	0x20587010UL
@@ -229,7 +227,8 @@ struct s31_pmu_regval {
  * timer deep sleep.  The sleep-specific half begins at 0x80; the active and
  * modem halves are equally important because the PMU consumes them while
  * sequencing the wake transition. */
-static const struct s31_pmu_regval s31_pmu_deep_profile[] = {
+static const struct s31_pmu_regval s31_pmu_deep_profile[]
+__attribute__((section(".data.s31_pmu_profile"))) = {
 	{ 0x000, 0x00000000 }, { 0x004, 0xffffffff },
 	{ 0x008, 0xffffffff }, { 0x00c, 0xffffffff },
 	{ 0x010, 0xffffffff }, { 0x014, 0x80000000 },
@@ -279,7 +278,7 @@ static const struct s31_pmu_regval s31_pmu_deep_profile[] = {
 	{ 0x200, 0x000003ff }, { 0x208, 0xc0000000 },
 };
 
-static void s31_pmu_apply_deep_profile(void)
+static inline __attribute__((always_inline)) void s31_pmu_apply_deep_profile(void)
 {
 	unsigned int i;
 
@@ -679,6 +678,12 @@ static int s31_clic_ecall(unsigned long extid, unsigned long funcid,
 	case S31_SBI_CLIC_MIE:
 		out->value = csr_read(CSR_MIE);
 		break;
+	case S31_SBI_CLIC_WFI_GUARD_US:
+		/* The private comparator runs at 1 MHz. Let the supervisor describe
+		 * the interrupt-delivery bound without duplicating firmware policy.
+		 */
+		out->value = S31_IDLE_TIMER_GUARD_TICKS;
+		break;
 	case 6: {
 		/* Complete SRAM footprint, including runtime stacks and heap.
 		 * Linux radio must exclude this from its reclaimed low SRAM. */
@@ -735,7 +740,7 @@ s31_suspend_request_wait(volatile u32 *control, int result)
 {
 	u32 start, raw;
 
-	if (result || control[19] != S31_LP_SLEEP_HP_ASLEEP) {
+	if (result || control[19] != S31_LP_SLEEP_HP_ASLEEP || control[21]) {
 		if (!result)
 			result = SBI_ERR_FAILED;
 		goto restore;
@@ -768,12 +773,12 @@ restore:
 	return result;
 }
 
-/* The LP response CRC is published after programming target1 and enabling
- * its interrupt. TAR_EN is a write trigger, not a readable enable latch.
+/* The LP response CRC commits HP_ASLEEP after programming selected sources
+ * (target1 when a timer is selected). TAR_EN is a write trigger, not a latch.
  * ARM has completed before entry, so only the MEM timer commit (or wake)
  * can replace that response. Require a new, stable, valid response before
  * consuming the target registers. A checksum collision fails closed. */
-static bool s31_suspend_timer_committed(volatile u32 *control, u32 armed_crc)
+static bool s31_suspend_lp_committed(volatile u32 *control, u32 armed_crc)
 {
 	volatile u8 *bytes = (volatile u8 *)control;
 	u32 response = control[27], crc = ~0U;
@@ -789,7 +794,7 @@ static bool s31_suspend_timer_committed(volatile u32 *control, u32 armed_crc)
 	}
 	RISCV_FENCE(rw, rw);
 	return response == control[27] && response == ~crc &&
-		control[19] == S31_LP_SLEEP_HP_ASLEEP;
+		control[19] == S31_LP_SLEEP_HP_ASLEEP && !control[21];
 }
 
 static int s31_system_suspend(u32 sleep_type,
@@ -799,28 +804,37 @@ static int s31_system_suspend(u32 sleep_type,
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 	void *runtime_rw = (void *)(scratch->fw_start + scratch->fw_rw_offset);
 	int result;
-	u32 start, armed_crc;
+	u32 start, armed_crc, wake_sources;
+	bool gpio_types_valid = !(control[10] >> 24);
+	unsigned int pin;
 
-	sbi_printf("S31 SUSP: backend entry state=%u\n", control[19]);
+	for (pin = 0; pin < 8; pin++) {
+		u32 type = (control[10] >> (3 * pin)) & 7U;
+
+		if ((control[8] & BIT(pin)) ? (type < 1 || type > 5) : type != 0)
+			gpio_types_valid = false;
+	}
+
 	if (control[0] != S31_LP_SLEEP_MAGIC ||
 	    control[1] != S31_LP_SLEEP_ABI_VERSION ||
-	    control[2] < 28U * sizeof(u32) ||
+	    control[2] != 28U * sizeof(u32) ||
 	    !(control[4] & S31_LP_SLEEP_F_MEM) ||
 	    (control[4] & ~(S31_LP_SLEEP_F_MEM |
-			   S31_LP_SLEEP_F_GPIO_PULL_UP |
-			   S31_LP_SLEEP_F_GPIO_PULL_DOWN)) ||
-	    ((control[4] & S31_LP_SLEEP_F_GPIO_PULL_UP) &&
-	     (control[4] & S31_LP_SLEEP_F_GPIO_PULL_DOWN)) ||
-	    ((control[4] & (S31_LP_SLEEP_F_GPIO_PULL_UP |
-			    S31_LP_SLEEP_F_GPIO_PULL_DOWN)) &&
-	     !(control[5] & S31_LP_WAKE_GPIO)) ||
-	    !(control[5] & S31_LP_WAKE_TIMER) ||
+			   S31_LP_SLEEP_F_RTC_ABSOLUTE)) ||
+	    (!!(control[4] & S31_LP_SLEEP_F_RTC_ABSOLUTE) !=
+	     !!(control[5] & S31_LP_WAKE_TIMER)) || control[7] > 0xffffU ||
+	    !control[5] ||
 	    (control[5] & ~(S31_LP_WAKE_TIMER | S31_LP_WAKE_GPIO)) ||
+	    (!(control[5] & S31_LP_WAKE_GPIO) &&
+	     (control[8] || control[9] || control[10] || control[11])) ||
+	    (!(control[5] & S31_LP_WAKE_TIMER) && (control[6] || control[7])) ||
 	    ((control[5] & S31_LP_WAKE_GPIO) &&
-	     (!control[8] || (control[8] & ~0xffU) || control[9] ||
-	      control[11] || (control[10] & ~control[8]))) ||
+	     (!control[8] || (control[8] & ~0xffU) ||
+	      ((control[9] | control[11]) & ~control[8]) ||
+	      (control[9] & control[11]) ||
+	      !gpio_types_valid)) ||
 	    control[12] != ~0U || control[13] != ~0U ||
-	    control[14] != ~0U || control[19] != S31_LP_SLEEP_ARMED) {
+	    control[14] != ~0U || control[19] != S31_LP_SLEEP_ARMED || control[21]) {
 		sbi_printf("S31 SUSP: invalid LP descriptor state=%x result=%x reason=%x raw=%x deadline=%08x:%08x sleep=%08x:%08x wake=%08x:%08x\n",
 			   control[19], control[20], control[21], control[22],
 			   control[7], control[6],
@@ -847,7 +861,7 @@ static int s31_system_suspend(u32 sleep_type,
 	writel_relaxed(S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT |
 		       S31_PMU_SW_INT,
 		       (void *)S31_PMU_INT_CLR);
-	writel_relaxed(S31_PMU_SLEEP_REJECT, (void *)S31_PMU_WAKE_CNTL4);
+	writel_relaxed(S31_PMU_REJECT_CAUSE_CLR, (void *)S31_PMU_WAKE_CNTL4);
 	/* Keep OpenSBI's HP-SRAM RW/scratch region alive.  The IDF default sleep
 	 * profile powers the memory and logic retention rails down; start from
 	 * the proven active regulator settings, then tune retention bias only
@@ -872,13 +886,22 @@ static int s31_system_suspend(u32 sleep_type,
 	writel_relaxed(readl_relaxed((void *)S31_PMU_HP_SLEEP_BACKUP) |
 		       S31_PMU_HP_ACTIVE2SLEEP_BACKUP_EN,
 		       (void *)S31_PMU_HP_SLEEP_BACKUP);
-	writel_relaxed(0, (void *)S31_PMU_WAKE_CNTL1);
 	/* The retained helper waits for LP target1 arming before installing
-	 * target0 and requesting power gating. */
-	writel_relaxed(S31_PMU_RTC_TIMER_WAKEUP |
+	 * target0 and requesting power gating. Keep the LP software wake latched
+	 * as well: the GPIO ISR can consume a short pad edge before HP gates.
+	 */
+	wake_sources = ((control[5] & S31_LP_WAKE_TIMER) ?
+			S31_PMU_RTC_TIMER_WAKEUP : 0) |
 		       ((control[5] & S31_LP_WAKE_GPIO) ?
-			S31_PMU_LP_GPIO_WAKEUP : 0),
-		       (void *)S31_PMU_WAKE_CNTL2);
+			S31_PMU_LP_GPIO_WAKEUP | S31_PMU_LP_CORE_WAKEUP : 0);
+	writel_relaxed(wake_sources, (void *)S31_PMU_WAKE_CNTL2);
+	/* Match IDF's reject mask and enable register, so a source which goes
+	 * pending after the final software check rejects entry instead of being
+	 * lost. CNTL4 is only the reject-cause clear strobe.
+	 */
+	writel_relaxed(wake_sources, (void *)S31_PMU_WAKE_CNTL1);
+	writel_relaxed(readl_relaxed((void *)S31_PMU_WAKE_CNTL0) |
+		       S31_PMU_SLEEP_REJECT, (void *)S31_PMU_WAKE_CNTL0);
 	RISCV_FENCE(iorw, iorw);
 	/* HSM state, system_suspended and scratch resume metadata were updated by
 	 * the generic SBI layer immediately before this callback.  S31's D-cache
@@ -913,11 +936,12 @@ static int s31_system_suspend(u32 sleep_type,
 	armed_crc = control[27];
 	control[19] = S31_LP_SLEEP_HP_ASLEEP;
 	RISCV_FENCE(rw, rw);
-	/* MEM ARM defers target1 until HP_ASLEEP. Wait for the LP firmware's
-	 * completed response before mirroring the freshly programmed deadline. */
+	/* Wait for the LP firmware to commit HP_ASLEEP and its selected wake
+	 * sources. GPIO-only requests need the same handshake, with no deadline.
+	 */
 	start = csr_read(CSR_CYCLE);
-	while (!s31_suspend_timer_committed(control, armed_crc)) {
-		if (control[19] != S31_LP_SLEEP_HP_ASLEEP ||
+	while (!s31_suspend_lp_committed(control, armed_crc)) {
+		if (control[19] != S31_LP_SLEEP_HP_ASLEEP || control[21] ||
 		    (u32)(csr_read(CSR_CYCLE) - start) > S31_LP_WAIT_CYCLES) {
 			result = SBI_ERR_TIMEOUT;
 			goto request;
@@ -927,12 +951,16 @@ static int s31_system_suspend(u32 sleep_type,
 	 * value present during the earlier Linux device suspend phase. */
 	writel_relaxed(S31_RTC_TIMER_SOC_WAKE_CLR,
 		       (void *)S31_RTC_TIMER_INT_CLR);
-	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_TAR1_LO),
-		       (void *)S31_RTC_TIMER_TAR0_LO);
-	writel_relaxed((readl_relaxed((void *)S31_RTC_TIMER_TAR1_HI) & 0xffffU) |
-		       S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
+	if (control[5] & S31_LP_WAKE_TIMER) {
+		writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_TAR1_LO),
+			       (void *)S31_RTC_TIMER_TAR0_LO);
+		writel_relaxed((readl_relaxed((void *)S31_RTC_TIMER_TAR1_HI) & 0xffffU) |
+			       S31_RTC_TIMER_TAR_EN, (void *)S31_RTC_TIMER_TAR0_HI);
+	} else {
+		writel_relaxed(0, (void *)S31_RTC_TIMER_TAR0_HI);
+	}
 	RISCV_FENCE(iorw, iorw);
-	if (control[19] != S31_LP_SLEEP_HP_ASLEEP) {
+	if (control[19] != S31_LP_SLEEP_HP_ASLEEP || control[21]) {
 		result = SBI_ERR_FAILED;
 		goto request;
 	}
@@ -995,10 +1023,8 @@ s31_reboot(void)
  * Keep every instruction after that write in HP SRAM, just like IDF's
  * IRAM_ATTR pmu_sleep_start(). */
 static void __attribute__((section(".data.s31_flash_text"), noinline, noreturn))
-s31_shutdown_failed(bool timed)
+s31_shutdown_failed(void)
 {
-	if (timed)
-		s31_reboot();
 	/* A failed power-off must not turn into an unsolicited reboot. */
 	csr_clear(CSR_MSTATUS, MSTATUS_MIE);
 	for (;;)
@@ -1006,9 +1032,35 @@ s31_shutdown_failed(bool timed)
 }
 
 static void __attribute__((section(".data.s31_flash_text"), noinline, noreturn))
-s31_deep_enter_sram(volatile u32 *control, bool timed)
+s31_deep_enter_sram(bool timed, u64 deadline)
 {
-	u32 start;
+	u32 start, high, low, check;
+	u64 now;
+
+
+	writel_relaxed(readl_relaxed((void *)S31_LP_CLKRST_ROOT_CLK_CONF) &
+		       ~S31_LP_CLKRST_FAST_CLK_SEL,
+		       (void *)S31_LP_CLKRST_ROOT_CLK_CONF);
+	start = csr_read(CSR_CYCLE);
+	while ((u32)(csr_read(CSR_CYCLE) - start) <
+	       S31_RC_FAST_STABILIZE_CYCLES)
+		__asm__ __volatile__("nop");
+	/* Keep the final deadline check in SRAM too. A deadline which elapsed
+	 * during the handoff must produce a cold reboot, not an untimed sleep.
+	 */
+	if (timed) {
+		writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_UPDATE) |
+			       S31_RTC_TIMER_UPDATE_NOW,
+			       (void *)S31_RTC_TIMER_UPDATE);
+		do {
+			high = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
+			low = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_LO);
+			check = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
+		} while (high != check);
+		now = ((u64)high << 32) | low;
+		if (((now - deadline) & 0xffffffffffffULL) < (1ULL << 47))
+			s31_reboot();
+	}
 
 	writel_relaxed(S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT,
 		       (void *)S31_PMU_INT_CLR);
@@ -1020,48 +1072,94 @@ s31_deep_enter_sram(volatile u32 *control, bool timed)
 	RISCV_FENCE(iorw, iorw);
 
 	start = csr_read(CSR_CYCLE);
-	while ((u32)(csr_read(CSR_CYCLE) - start) < S31_LP_WAIT_CYCLES) {
-		if (timed && control[19] == S31_LP_SLEEP_WAKING)
-			s31_reboot();
+	while ((u32)(csr_read(CSR_CYCLE) - start) < S31_POWEROFF_WAIT_CYCLES) {
+		if (readl_relaxed((void *)S31_PMU_INT_RAW) & S31_PMU_SLEEP_REJECT)
+			break;
 		__asm__ __volatile__("nop");
 	}
-	s31_shutdown_failed(timed);
+	s31_shutdown_failed();
 }
 
-static bool s31_deep_sleep_armed(void)
+/* Consume a single committed eight-word request. A reset, stale MEM wake,
+ * or stopped/restarted LP firmware must not invent a poweroff deadline.
+ */
+static bool s31_poweroff_request(u32 *request)
 {
-	volatile u32 *control = (volatile u32 *)S31_LP_SLEEP_CONTROL;
+	volatile u32 *handoff = (volatile u32 *)S31_LP_POWEROFF_ADDR;
+	const u8 *bytes = (const u8 *)request;
+	u32 crc = ~0U;
+	unsigned int i, bit;
 
-	if (readl_relaxed((void *)S31_LP_SYS_STORE4) ==
-	    S31_DEEP_SLEEP_MAGIC)
+	/* No RTC controller is a valid untimed poweroff. The latch is cleared
+	 * at firmware boot even when the optional Linux LP driver is absent.
+	 */
+	if (!handoff[0]) {
+		sbi_memset(request, 0, 8U * sizeof(u32));
 		return true;
-
-	return control[0] == S31_LP_SLEEP_MAGIC &&
-	       control[1] == S31_LP_SLEEP_ABI_VERSION &&
-	       control[2] >= 28U * sizeof(u32) &&
-	       control[4] & S31_LP_SLEEP_F_DEEP_REBOOT &&
-	       !(control[4] & S31_LP_SLEEP_F_MEM) &&
-	       control[5] & S31_LP_WAKE_TIMER &&
-	       !(control[5] & ~(S31_LP_WAKE_TIMER | S31_LP_WAKE_GPIO)) &&
-	       control[19] == S31_LP_SLEEP_ARMED;
+	}
+	for (i = 0; i < 8; i++)
+		request[i] = handoff[i];
+	RISCV_FENCE(rw, rw);
+	handoff[0] = 0;
+	RISCV_FENCE(rw, rw);
+	for (i = 0; i < 7U * sizeof(u32); i++) {
+		crc ^= bytes[i];
+		for (bit = 0; bit < 8; bit++)
+			crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+	}
+	return request[0] == S31_LP_POWEROFF_MAGIC &&
+	       request[1] == S31_LP_POWEROFF_VERSION &&
+	       request[2] == 8U * sizeof(u32) &&
+	       !(request[3] & ~S31_LP_POWEROFF_RTC) &&
+	       request[5] <= 0xffffU && !request[6] && request[7] == ~crc &&
+	       (request[3] || (!request[4] && !request[5]));
 }
 
-static void __noreturn s31_deep_sleep(bool timed)
+static inline __attribute__((always_inline)) u64 s31_rtc_now(void)
 {
-	volatile u32 *control = (volatile u32 *)S31_LP_SLEEP_CONTROL;
-	u32 duration_ms = readl_relaxed((void *)S31_LP_SYS_STORE5);
-	u32 retained_wake_stub = readl_relaxed((void *)S31_LP_SYS_STORE8);
-	u32 now_lo, now_hi, check_hi;
-	u64 deadline;
-	u32 start;
-	uintptr_t reg;
+	u32 high, low, check;
 
-	/* Bit 0 selects ROM deep-sleep cold boot.  A zero wake-stub address asks
-	 * ROM to run the normal verified boot path instead of retained HP code. */
-	writel_relaxed(0, (void *)S31_LP_SYS_STORE4);
-	writel_relaxed(0, (void *)S31_LP_SYS_STORE5);
-	writel_relaxed(S31_DEEP_SLEEP_MAGIC, (void *)S31_LP_SYS_STORE2);
-	writel_relaxed(timed ? S31_LP_WAKE_TIMER : 0, (void *)S31_LP_SYS_STORE3);
+	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_UPDATE) |
+		       S31_RTC_TIMER_UPDATE_NOW, (void *)S31_RTC_TIMER_UPDATE);
+	do {
+		high = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
+		low = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_LO);
+		check = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
+	} while (high != check);
+	return ((u64)high << 32) | low;
+}
+
+static inline __attribute__((always_inline)) bool s31_poweroff_due(u64 deadline)
+{
+	return ((s31_rtc_now() - deadline) & 0xffffffffffffULL) < (1ULL << 47);
+}
+
+static void __attribute__((section(".data.s31_flash_text"), noinline, noreturn))
+s31_deep_sleep_sram(bool timed, u64 deadline)
+{
+	u32 start;
+	u32 peer = current_hartid() ^ 1U;
+	void *peer_ctrl = (void *)(S31_HP_CLKRST_CORE0_CTRL + peer * 4U);
+	uintptr_t reg;
+	u32 value;
+
+	/* Terminal poweroff discards both HP contexts. An idle peer may still
+	 * be inside the private M-mode WFI path and cannot acknowledge a stall
+	 * after its timer has shut down. Hold its core in reset and gate CPU/CLIC
+	 * clocks before PMU programming instead of waiting for an idle wakeup.
+	 * No hart may issue flash fetches after this SRAM boundary, including
+	 * speculative fetches or diagnostics on the calling hart.
+	 */
+	csr_clear(CSR_MSTATUS, MSTATUS_MIE);
+	s31_flash_prediction_suspend();
+	value = readl_relaxed(peer_ctrl);
+	writel_relaxed((value | S31_HP_CORE_GLOBAL_RST_EN) &
+		       ~(S31_HP_CORE_CPU_CLK_EN | S31_HP_CORE_CLIC_CLK_EN),
+		       peer_ctrl);
+	RISCV_FENCE(iorw, iorw);
+	if ((readl_relaxed(peer_ctrl) & 7U) != S31_HP_CORE_GLOBAL_RST_EN)
+		s31_shutdown_failed();
+
 	/* ROM samples LP_SYS_STORE8[0] to distinguish a deep-sleep cold boot
 	 * from a light-sleep resume.  Clear every retained wake-stub address bit:
 	 * Linux uses a different HP-retention warmboot vector for s2idle, and
@@ -1070,22 +1168,12 @@ static void __noreturn s31_deep_sleep(bool timed)
 	writel_relaxed(BIT(0), (void *)S31_LP_SYS_STORE8);
 	writel_relaxed(S31_PMU_SOC_WAKEUP | S31_PMU_SLEEP_REJECT |
 		       S31_PMU_SW_INT, (void *)S31_PMU_INT_CLR);
-	/* Target 1 belongs to the LP firmware, which Linux shutdown may restart.
-	 * Arm target 0 from a duration latched in LP_SYS instead of copying that
-	 * volatile target.  RTC_SLOW was measured by the resident LP firmware at
-	 * 155386 Hz on this clock profile; frequency error only shifts the delay. */
-	if (duration_ms < 1000U || duration_ms > 600000U)
-		duration_ms = 10000U;
-	writel_relaxed(readl_relaxed((void *)S31_RTC_TIMER_UPDATE) |
-		       S31_RTC_TIMER_UPDATE_NOW,
-		       (void *)S31_RTC_TIMER_UPDATE);
-	do {
-		now_hi = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
-		now_lo = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_LO);
-		check_hi = readl_relaxed((void *)S31_RTC_TIMER_COUNTER0_HI) & 0xffffU;
-	} while (now_hi != check_hi);
-	deadline = ((u64)now_hi << 32) | now_lo;
-	deadline += ((u64)duration_ms * S31_RTC_SLOW_HZ) / 1000U;
+	/* Linux supplies its calibrated absolute RTC target. Do not restart a
+	 * relative delay at this late boundary or assume a fixed RC frequency.
+	 */
+	if (timed && s31_poweroff_due(deadline)) {
+		s31_reboot();
+	}
 	writel_relaxed(S31_RTC_TIMER_SOC_WAKE_CLR,
 		       (void *)S31_RTC_TIMER_INT_CLR);
 	/* Match rtc_timer_ll_set_wakeup_time() exactly: program HI without the
@@ -1115,11 +1203,7 @@ static void __noreturn s31_deep_sleep(bool timed)
 		 S31_PMU_LP_CPU_WAITI_RDY)) {
 		if ((u32)(csr_read(CSR_CYCLE) - start) >
 		    S31_PMU_STALL_TIMEOUT_CYCLES) {
-			sbi_printf("S31 deep: LP hart did not enter WAITI pwr0=%08x raw=%08x wake=%08x\n",
-				   readl_relaxed((void *)S31_PMU_LP_CPU_PWR0),
-				   readl_relaxed((void *)S31_PMU_LP_INT_RAW),
-				   readl_relaxed((void *)S31_PMU_LP_CPU_PWR2));
-			s31_shutdown_failed(timed);
+			s31_shutdown_failed();
 		}
 	}
 	/* Remoteproc runs the LP core with reset/stall-on-sleep enabled.  Those
@@ -1201,33 +1285,34 @@ static void __noreturn s31_deep_sleep(bool timed)
 	writel_relaxed(0, (void *)S31_PMU_WAKE_CNTL1);
 	writel_relaxed(timed ? S31_PMU_RTC_TIMER_WAKEUP : 0,
 		       (void *)S31_PMU_WAKE_CNTL2);
-	/* RTC_FAST normally follows XTAL while Linux is running.  Deep sleep
-	 * powers XTAL down, so switch the PMU transition clock to the always-on
-	 * RC_FAST source before asserting sleep_req.  ROM/SPL restores the normal
-	 * runtime clock tree after the deep-sleep cold boot. */
-	writel_relaxed(readl_relaxed((void *)S31_LP_CLKRST_ROOT_CLK_CONF) &
-		       ~S31_LP_CLKRST_FAST_CLK_SEL,
-		       (void *)S31_LP_CLKRST_ROOT_CLK_CONF);
-	/* PMU_HP_SLEEP_LP_CK_POWER.xpd_fosc_clk was asserted by the profile.
-	 * Give RC_FAST the same 50 us startup allowance as rtc_clk_8m_enable()
-	 * before making it the sleep-transition source. */
-	start = csr_read(CSR_CYCLE);
-	while ((u32)(csr_read(CSR_CYCLE) - start) <
-	       S31_RC_FAST_STABILIZE_CYCLES)
-		__asm__ __volatile__("nop");
-	sbi_printf("S31 deep: ms=%u now=%04x:%08x target=%04x:%08x update=%08x wake2=%08x raw=%08x old_stub=%08x\n",
-		   duration_ms, now_hi, now_lo,
-		   (u32)(deadline >> 32) & 0xffffU, (u32)deadline,
-		   readl_relaxed((void *)S31_RTC_TIMER_UPDATE),
-		   readl_relaxed((void *)S31_PMU_WAKE_CNTL2),
-		   readl_relaxed((void *)S31_RTC_TIMER_TAR0_HI),
-		   retained_wake_stub);
-	control[19] = S31_LP_SLEEP_HP_ASLEEP;
-	RISCV_FENCE(rw, rw);
+	/* A deadline may also expire while the PMU profile is installed. Do not
+	 * silently leave the machine off with an alarm that can no longer fire.
+	 */
+	if (timed && s31_poweroff_due(deadline)) {
+		s31_reboot();
+	}
+	/* Only a hardware deep-sleep reset is success. A rejected/timed-out PMU
+	 * request halts in SRAM; it must never simulate a successful RTC wake.
+	 */
+	s31_deep_enter_sram(timed, deadline);
+}
+
+static void __noreturn s31_deep_sleep(void)
+{
+	u32 request[8];
+	bool timed;
+	u64 deadline;
+
+	if (!s31_poweroff_request(request)) {
+		sbi_printf("S31 poweroff: missing or invalid Linux handoff\n");
+		s31_shutdown_failed();
+	}
+	timed = request[3] & S31_LP_POWEROFF_RTC;
+	deadline = ((u64)request[5] << 32) | request[4];
 	/* Match rtc_clk_cpu_freq_set_xtal_for_sleep(): the PMU deep-sleep
 	 * sequencer must be entered with CPU, memory, system and APB clocks all at
 	 * the 40 MHz crystal rate.  SOC_CLK_UPDATE needs both HP harts, so Linux
-	 * performs this transition from its reboot notifier before stopping CPU1.
+	 * performs this transition from sys-off prepare before stopping CPU1.
 	 * Never retry the handshake here after the secondary hart is offline. */
 	if ((readl_relaxed((void *)S31_HP_CLKRST_SOC_CLK_SEL) &
 	     S31_HP_CLKRST_SOC_CLK_MASK) ||
@@ -1239,11 +1324,9 @@ static void __noreturn s31_deep_sleep(bool timed)
 	    (readl_relaxed((void *)S31_HP_CLKRST_APB_FREQ_CTRL) &
 	     S31_HP_CLKRST_DIV_MASK)) {
 		sbi_printf("S31 shutdown: Linux did not hand off clocks to XTAL\n");
-		s31_shutdown_failed(timed);
+		s31_shutdown_failed();
 	}
-	/* Enter the PMU state machine from SRAM.  This call never returns: either
-	 * the PMU completes deep sleep, or the bounded fail-closed path resets. */
-	s31_deep_enter_sram(control, timed);
+	s31_deep_sleep_sram(timed, deadline);
 }
 
 static int s31_system_reset_check(u32 type, u32 reason)
@@ -1256,7 +1339,7 @@ static int s31_system_reset_check(u32 type, u32 reason)
 static void s31_system_reset(u32 type, u32 reason)
 {
 	if (type == SBI_SRST_RESET_TYPE_SHUTDOWN)
-		s31_deep_sleep(s31_deep_sleep_armed());
+		s31_deep_sleep();
 	s31_reboot();
 }
 
@@ -1269,6 +1352,9 @@ static struct sbi_system_reset_device s31_reset = {
 int s31_services_register(void)
 {
 	int ret;
+
+	/* Never reuse a deadline across a warm reset or a deep-sleep cold boot. */
+	writel_relaxed(0, (void *)S31_LP_POWEROFF_ADDR);
 
 	ret = sbi_ecall_register_extension(&s31_flash_ecall_ext);
 	if (ret)

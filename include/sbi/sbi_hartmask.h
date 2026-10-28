@@ -20,7 +20,14 @@
  * also represents the maximum number of HART ids generic OpenSBI
  * can handle.
  */
+#ifdef CONFIG_PLATFORM_ESPRESSIF_ESP32S31
+/* The S31 platform fixes physical hart IDs to 0 and 1. Do not reserve
+ * arrays for 128 harts in the SRAM shared with radio and PM retention.
+ */
+#define SBI_HARTMASK_MAX_BITS		2
+#else
 #define SBI_HARTMASK_MAX_BITS		128
+#endif
 
 /** Representation of hartmask */
 struct sbi_hartmask {
